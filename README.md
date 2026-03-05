@@ -135,19 +135,30 @@ The weighted average becomes the round's score. If it meets the threshold (defau
 - **[Claude CLI](https://docs.anthropic.com/en/docs/claude-cli)** — installed and authenticated
 - **tmux** — for managing agent sessions
 
-### Setup
+### Install from PyPI
 
 ```bash
-# Clone the repository
+pip install x-ai-orchestrator
+```
+
+Or with [pipx](https://pipx.pypa.io/) (recommended — installs in isolated environment):
+
+```bash
+pipx install x-ai-orchestrator
+```
+
+After installation, the `x-ai` command is available globally:
+
+```bash
+x-ai --version
+```
+
+### Install from Source
+
+```bash
 git clone https://github.com/manhpham90vn/x-ai.git
 cd x-ai
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+pip install .
 ```
 
 ## Usage
@@ -156,10 +167,10 @@ pip install -r requirements.txt
 
 ```bash
 # Run with a coding task
-python -m x_ai_cli "Add JWT authentication to the Flask API" -d /path/to/project
+x-ai "Add JWT authentication to the Flask API" -d /path/to/project
 
 # Short form
-python -m x_ai_cli "Fix the login bug" -d ./my-app
+x-ai "Fix the login bug" -d ./my-app
 ```
 
 ### CLI Options
@@ -177,16 +188,16 @@ python -m x_ai_cli "Fix the login bug" -d ./my-app
 
 ```bash
 # Complex task with higher quality bar
-python -m x_ai_cli "Refactor the database layer to use SQLAlchemy async sessions" \
+x-ai "Refactor the database layer to use SQLAlchemy async sessions" \
   -d /path/to/project \
   --threshold 85 \
   --max-rounds 5
 
 # Quick fix with lower threshold
-python -m x_ai_cli "Fix typo in README" -d ./my-repo -t 50 -r 1
+x-ai "Fix typo in README" -d ./my-repo -t 50 -r 1
 
 # Verbose mode for debugging
-python -m x_ai_cli "Add unit tests for the auth module" -d ./api -v
+x-ai "Add unit tests for the auth module" -d ./api -v
 ```
 
 ### Environment Variables
