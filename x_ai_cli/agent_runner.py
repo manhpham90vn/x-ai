@@ -431,56 +431,116 @@ class AgentRunner:
     ) -> str | None:
         """Wait for Claude to finish responding.
 
-        Polls capture-pane. Claude is done when:
-        - Prompt marker (❯) reappears in last line
-        - While waiting, auto-handles any runtime confirmations
+        Robust approach:
+        1. Wait minimum 10s for Claude to start processing
+        2. Then poll every 2s for completion:
+           - Claude is DONE when capture-pane has NO processing indicators
+             AND an empty ❯ line (no text after it)
+           - Must see this state in TWO consecutive polls to avoid
+             false positives from TUI transitions
 
-        Returns the full captured output, or None on timeout.
+        Returns the full captured scrollback, or None on timeout.
         """
         marker = self.config.prompt_marker
-
-        # Wait a bit for Claude to start processing
-        await asyncio.sleep(3)
+        processing_indicators = [
+            "thinking",
+            "sprouting",
+            "clauding",
+            "working",
+            "reading",
+            "writing",
+            "processing",
+            "waiting",
+            "searching",
+            "analyzing",
+            "running",
+            "building",
+            "crafting",
+            "composing",
+            "generating",
+            "editing",
+            "envisioning",
+            "creating",
+        ]
 
         start = time.monotonic()
         logger.info("Waiting for response in %s (timeout: %ds)", session_name, timeout)
 
+        # Minimum wait before checking completion — Claude needs time to
+        # read the prompt file, think, and start generating output
+        min_wait = 10
+        logger.debug("Phase 1: minimum wait %ds for processing to start", min_wait)
+        await asyncio.sleep(min_wait)
+
+        # Phase 2: Poll for completion with double-check
+        consecutive_done = 0
+        poll_interval = 2.0
+
         while time.monotonic() - start < timeout:
             output = await self.tmux.capture_pane(session_name)
             lines = output.strip().splitlines() if output.strip() else []
+            tail = "\n".join(lines[-10:]).lower() if lines else ""
 
-            # Handle runtime confirmations (like tmux-injector.js handleConfirmations)
-            if lines:
-                tail_lower = "\n".join(lines[-5:]).lower()
+            # Handle runtime confirmations
+            if "do you want to proceed?" in tail:
+                logger.info("Runtime confirmation detected, auto-accepting")
+                await self.tmux.send_text(session_name, "2")
+                await asyncio.sleep(0.3)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(2)
+                consecutive_done = 0
+                continue
 
-                # Auto-accept runtime confirmations
-                if "do you want to proceed?" in tail_lower:
-                    logger.info("Runtime confirmation detected, auto-accepting")
-                    await self.tmux.send_text(session_name, "2")
-                    await asyncio.sleep(0.3)
-                    await self.tmux.send_keys_raw(session_name, "Enter")
-                    await asyncio.sleep(2)
-                    continue
+            if "(y/n)" in tail or "[y/n]" in tail:
+                logger.info("Runtime Y/N prompt, sending 'y'")
+                await self.tmux.send_text(session_name, "y")
+                await asyncio.sleep(0.3)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(1)
+                consecutive_done = 0
+                continue
 
-                if "(y/n)" in tail_lower or "[y/n]" in tail_lower:
-                    logger.info("Runtime Y/N prompt, sending 'y'")
-                    await self.tmux.send_text(session_name, "y")
-                    await asyncio.sleep(0.3)
-                    await self.tmux.send_keys_raw(session_name, "Enter")
-                    await asyncio.sleep(1)
-                    continue
+            # Check if still processing
+            is_processing = any(ind in tail for ind in processing_indicators)
 
-            # Check if Claude is done (prompt marker reappears)
-            # ❯ is NOT on the very last line — status bar is below it
-            for line in lines[-5:] if lines else []:
+            if is_processing:
+                consecutive_done = 0
+                logger.debug(
+                    "Still processing (%ds elapsed)",
+                    int(time.monotonic() - start),
+                )
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # Not processing — check for empty ❯ marker
+            has_empty_marker = False
+            for line in lines[-8:] if lines else []:
                 if marker in line and "bypass" not in line.lower():
+                    after_marker = line.split(marker, 1)[-1].strip()
+                    if not after_marker:
+                        has_empty_marker = True
+                        break
+
+            if has_empty_marker:
+                consecutive_done += 1
+                if consecutive_done >= 2:
                     elapsed = time.monotonic() - start
                     logger.info(
-                        "Response completed in %s (%.1fs)", session_name, elapsed
+                        "Response completed in %s (%.1fs, confirmed)",
+                        session_name,
+                        elapsed,
                     )
                     return await self.tmux.capture_full(session_name)
+                else:
+                    logger.debug(
+                        "Possible completion (check %d/2, %ds elapsed)",
+                        consecutive_done,
+                        int(time.monotonic() - start),
+                    )
+            else:
+                consecutive_done = 0
 
-            await asyncio.sleep(self.config.poll_interval_sec)
+            await asyncio.sleep(poll_interval)
 
         logger.warning("Timed out waiting for response in %s", session_name)
         return await self.tmux.capture_full(session_name)
