@@ -9,7 +9,6 @@ with optional git worktree isolation.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,7 +29,6 @@ from x_ai_cli.models import (
     Feedback,
     ReviewResult,
     SubTask,
-    new_id,
 )
 
 
@@ -150,10 +148,15 @@ class Orchestrator:
                 f"{self.config.num_workers} workers)",
             )
             worker_results = await self.run_workers(
-                sub_task, round_num, feedback, original_request,
+                sub_task,
+                round_num,
+                feedback,
+                original_request,
             )
 
-            successful = {k: v for k, v in worker_results.items() if v.status != "error"}
+            successful = {
+                k: v for k, v in worker_results.items() if v.status != "error"
+            }
             if not successful:
                 logger.error("No workers produced a result in round %d", round_num)
                 continue
@@ -195,7 +198,9 @@ class Orchestrator:
                 feedback = self._build_feedback(review, exec_result=None)
 
         # Exhausted all rounds
-        logger.warning("Max rounds (%d) exhausted — returning best-effort", self.config.max_rounds)
+        logger.warning(
+            "Max rounds (%d) exhausted — returning best-effort", self.config.max_rounds
+        )
         return PipelineResult(
             status="best_effort",
             solution=best_solution,
@@ -215,11 +220,10 @@ class Orchestrator:
         task_files: dict[str, Path] = {}
 
         instructions = (
-            f"Original request: {original_request}\n\n"
-            f"Sub-task: {sub_task.description}"
+            f"Original request: {original_request}\n\nSub-task: {sub_task.description}"
         )
         if sub_task.constraints:
-            instructions += f"\n\nConstraints:\n" + "\n".join(
+            instructions += "\n\nConstraints:\n" + "\n".join(
                 f"- {c}" for c in sub_task.constraints
             )
 
@@ -358,8 +362,7 @@ class Orchestrator:
         merge_text = ""
         for sub_task, result in zip(sub_tasks, results):
             merge_text += (
-                f"### Sub-task: {sub_task.description}\n"
-                f"**Status**: {result.status}\n\n"
+                f"### Sub-task: {sub_task.description}\n**Status**: {result.status}\n\n"
             )
             if result.solution:
                 merge_text += f"{result.solution.body}\n\n---\n\n"
@@ -424,7 +427,11 @@ class Orchestrator:
                 if line.strip() == "":
                     # Empty line might end the block or be spacing within it
                     current_block.append(line)
-                elif line.startswith(" ") or line.startswith("\t") or line.startswith("-"):
+                elif (
+                    line.startswith(" ")
+                    or line.startswith("\t")
+                    or line.startswith("-")
+                ):
                     current_block.append(line)
                 else:
                     # Non-indented, non-numbered line → end of block
@@ -454,7 +461,10 @@ class Orchestrator:
                 # Simple heuristic: check if this worker is mentioned near "best" or "recommend"
                 idx = review_lower.find(worker_name.lower())
                 context = review_lower[max(0, idx - 50) : idx + 50]
-                if any(word in context for word in ["best", "recommend", "base", "winner", "pick"]):
+                if any(
+                    word in context
+                    for word in ["best", "recommend", "base", "winner", "pick"]
+                ):
                     return worker_name
         # Fallback: first worker
         return next(iter(worker_results), None)
@@ -475,7 +485,10 @@ class Orchestrator:
             lines = review.merge_plan.split("\n")
             for line in lines:
                 line_stripped = line.strip().lstrip("- ").lstrip("* ")
-                if any(kw in line.lower() for kw in ["fix", "issue", "bug", "missing", "add"]):
+                if any(
+                    kw in line.lower()
+                    for kw in ["fix", "issue", "bug", "missing", "add"]
+                ):
                     if line_stripped and len(line_stripped) > 10:
                         feedback.mandatory_fixes.append(line_stripped)
 

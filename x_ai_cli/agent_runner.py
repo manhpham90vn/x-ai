@@ -25,7 +25,7 @@ from pathlib import Path
 
 from x_ai_cli.config import Config
 from x_ai_cli.logger import logger, log_agent_start, log_agent_done
-from x_ai_cli.models import AgentResult, parse_frontmatter, write_frontmatter
+from x_ai_cli.models import AgentResult
 
 
 class TmuxSession:

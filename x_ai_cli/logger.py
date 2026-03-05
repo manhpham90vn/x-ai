@@ -6,7 +6,6 @@ Provides rich console output and optional file logging.
 from __future__ import annotations
 
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 

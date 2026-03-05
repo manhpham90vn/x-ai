@@ -13,7 +13,7 @@ from rich.table import Table
 
 from x_ai_cli import __version__
 from x_ai_cli.config import Config
-from x_ai_cli.logger import console, logger, setup_logging, log_phase
+from x_ai_cli.logger import console, logger, setup_logging
 from x_ai_cli.orchestrator import Orchestrator
 
 
@@ -28,35 +28,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="The coding task to execute",
     )
     parser.add_argument(
-        "--work-dir", "-d",
+        "--work-dir",
+        "-d",
         default=".",
         help="Working directory for the project (default: current dir)",
     )
     parser.add_argument(
-        "--max-rounds", "-r",
+        "--max-rounds",
+        "-r",
         type=int,
         default=3,
         help="Maximum retry rounds (default: 3)",
     )
     parser.add_argument(
-        "--threshold", "-t",
+        "--threshold",
+        "-t",
         type=float,
         default=70.0,
         help="Quality threshold score 0-100 (default: 70.0)",
     )
     parser.add_argument(
-        "--workers", "-w",
+        "--workers",
+        "-w",
         type=int,
         default=2,
         help="Number of parallel Claude workers (default: 2)",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose/debug output",
     )
     parser.add_argument(
-        "--version", "-V",
+        "--version",
+        "-V",
         action="version",
         version=f"x-ai {__version__}",
     )
@@ -137,7 +143,9 @@ async def async_main(args: argparse.Namespace) -> int:
     )
 
     print_banner()
-    console.print(f"[dim]Prompt:[/dim] {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+    console.print(
+        f"[dim]Prompt:[/dim] {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+    )
     console.print(f"[dim]Work dir:[/dim] {config.work_path}")
     console.print(f"[dim]Max rounds:[/dim] {config.max_rounds}")
     console.print(f"[dim]Workers:[/dim] {config.num_workers} (tmux + worktree)")
@@ -157,9 +165,12 @@ async def async_main(args: argparse.Namespace) -> int:
             # Second Ctrl+C — force exit immediately
             console.print("\n[error]Force exit![/error]")
             import os
+
             os._exit(130)
         _shutting_down = True
-        console.print("\n[warning]Shutting down gracefully (Ctrl+C again to force)...[/warning]")
+        console.print(
+            "\n[warning]Shutting down gracefully (Ctrl+C again to force)...[/warning]"
+        )
         # Cancel the main task so the await below raises CancelledError
         if main_task and not main_task.done():
             main_task.cancel()
@@ -181,7 +192,9 @@ async def async_main(args: argparse.Namespace) -> int:
         console.print("[warning]Interrupted — cleaning up...[/warning]")
         try:
             # Cancel the orchestrator's running tasks if possible
-            if hasattr(orchestrator, 'runner') and hasattr(orchestrator.runner, 'cleanup_all'):
+            if hasattr(orchestrator, "runner") and hasattr(
+                orchestrator.runner, "cleanup_all"
+            ):
                 await asyncio.wait_for(orchestrator.runner.cleanup_all(), timeout=10)
                 console.print("[success]All tmux sessions cleaned up ✓[/success]")
         except Exception:
