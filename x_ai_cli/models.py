@@ -2,6 +2,10 @@
 
 Defines all dataclasses for tasks, results, feedback, and
 provides YAML frontmatter parsing/writing for Markdown files.
+
+Planner-Executor model:
+- Planner creates plans and reviews code
+- Executor implements code following the plan
 """
 
 from __future__ import annotations
@@ -62,23 +66,11 @@ def now_iso() -> str:
 
 
 @dataclass
-class SubTask:
-    """A sub-task decomposed from the original user request."""
-
-    id: str = field(default_factory=new_id)
-    description: str = ""
-    language: str | None = None
-    constraints: list[str] = field(default_factory=list)
-    context_files: list[str] = field(default_factory=list)
-
-
-@dataclass
 class Task:
     """Top-level task representing the user's original request."""
 
     id: str = field(default_factory=new_id)
     original_request: str = ""
-    sub_tasks: list[SubTask] = field(default_factory=list)
     status: str = "pending"  # pending | in_progress | completed | failed
     current_round: int = 0
     created_at: str = field(default_factory=now_iso)
@@ -89,15 +81,21 @@ class AgentTask:
     """A task file to be written for an agent to consume.
 
     Serialised to `{task_id}.task.md`.
+
+    task_type:
+        - plan: Planner reads repo and creates implementation plan
+        - execute: Executor follows plan and implements code
+        - review: Planner reviews Executor's code changes
     """
 
     id: str = field(default_factory=new_id)
-    task_type: str = "generate"  # decompose | generate | review | merge | execute
+    task_type: str = "execute"  # plan | execute | review
     work_dir: str = "."
     round: int = 1
     parent_task_id: str | None = None
     instructions: str = ""
     context: str = ""
+    plan_content: str = ""  # Plan from Planner, sent to Executor
     feedback: Feedback | None = None
 
     def to_markdown(self) -> str:
@@ -113,12 +111,14 @@ class AgentTask:
                 "mandatory_fixes": self.feedback.mandatory_fixes,
                 "score_gaps": self.feedback.score_gaps,
                 "execution_errors": self.feedback.execution_errors,
-                "previous_best_approach": self.feedback.previous_best_approach,
+                "previous_score": self.feedback.previous_score,
             }
         else:
             meta["feedback"] = None
 
         body_parts = [f"## Instructions\n\n{self.instructions}"]
+        if self.plan_content:
+            body_parts.append(f"## Implementation Plan\n\n{self.plan_content}")
         if self.context:
             body_parts.append(f"## Context\n\n{self.context}")
 
@@ -170,23 +170,21 @@ class AgentResult:
 
 @dataclass
 class ReviewResult:
-    """Parsed review from the Leader agent."""
+    """Parsed review from the Planner agent."""
 
-    best_worker: str = ""
-    best_score: float = 0.0
-    best_solution: AgentResult | None = None
-    merge_plan: str = ""
-    all_scores: dict[str, float] = field(default_factory=dict)
+    score: float = 0.0
+    review_notes: str = ""
+    solution: AgentResult | None = None
 
 
 @dataclass
 class Feedback:
-    """Structured feedback for the next round of workers."""
+    """Structured feedback for the next round."""
 
     mandatory_fixes: list[str] = field(default_factory=list)
     score_gaps: dict[str, str] = field(default_factory=dict)
     execution_errors: list[str] = field(default_factory=list)
-    previous_best_approach: str = ""
+    previous_score: float = 0.0
 
 
 @dataclass

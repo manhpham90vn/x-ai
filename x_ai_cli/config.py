@@ -1,4 +1,7 @@
-"""Configuration for x-ai CLI orchestrator."""
+"""Configuration for x-ai CLI orchestrator.
+
+Planner-Executor model — no multi-worker, no worktree.
+"""
 
 from __future__ import annotations
 
@@ -21,16 +24,12 @@ class Config:
     logs_dir: str = "logs"
     max_rounds: int = 3
     quality_threshold: float = 70.0
-    worker_timeout_sec: int = 300  # 5 min per worker agent
-    leader_timeout_sec: int = 600  # 10 min per leader agent
+    planner_timeout_sec: int = 600  # 10 min per planner agent
+    executor_timeout_sec: int = 600  # 10 min per executor agent
 
     # Interactive mode settings
     prompt_marker: str = "❯"  # Marker to detect Claude is ready for input
     poll_interval_sec: float = 1.0  # Interval for polling tmux output
-
-    # Worker settings
-    num_workers: int = 2  # Number of parallel Claude workers
-    use_worktree: bool = True  # Use git worktree isolation per worker
 
     # Logging
     verbose: bool = False
@@ -79,11 +78,8 @@ class Config:
             work_dir=os.getenv("XAI_WORK_DIR", "."),
             max_rounds=int(os.getenv("XAI_MAX_ROUNDS", "3")),
             quality_threshold=float(os.getenv("XAI_QUALITY_THRESHOLD", "70.0")),
-            worker_timeout_sec=int(os.getenv("XAI_WORKER_TIMEOUT", "300")),
-            leader_timeout_sec=int(os.getenv("XAI_LEADER_TIMEOUT", "600")),
-            num_workers=int(os.getenv("XAI_NUM_WORKERS", "2")),
-            use_worktree=os.getenv("XAI_USE_WORKTREE", "true").lower()
-            in ("1", "true", "yes"),
+            planner_timeout_sec=int(os.getenv("XAI_PLANNER_TIMEOUT", "600")),
+            executor_timeout_sec=int(os.getenv("XAI_EXECUTOR_TIMEOUT", "600")),
             verbose=os.getenv("XAI_VERBOSE", "").lower() in ("1", "true", "yes"),
             prompt_marker=os.getenv("XAI_PROMPT_MARKER", "❯"),
             poll_interval_sec=float(os.getenv("XAI_POLL_INTERVAL", "1.0")),
