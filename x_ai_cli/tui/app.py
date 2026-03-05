@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import re
 from typing import Any
 
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Grid, Horizontal, Vertical
@@ -112,6 +114,27 @@ class ConfigScreen(ModalScreen[tuple[str, int, float, int, int]]):
         self.dismiss()
 
 
+# Regex to match ANSI background color escape sequences:
+# - \x1b[4Xm (standard bg 40-47), \x1b[49m (default bg)
+# - \x1b[10Xm (bright bg 100-107)
+# - \x1b[48;5;Nm (256-color bg)
+# - \x1b[48;2;R;G;Bm (truecolor bg)
+_ANSI_BG_RE = re.compile(
+    r"\x1b\["
+    r"(?:"
+    r"4[0-9]"  # standard bg 40-49
+    r"|10[0-7]"  # bright bg 100-107
+    r"|48;5;\d+"  # 256-color bg
+    r"|48;2;\d+;\d+;\d+"  # truecolor bg
+    r")m"
+)
+
+
+def _strip_ansi_bg(text: str) -> str:
+    """Remove ANSI background color codes, keeping foreground colors intact."""
+    return _ANSI_BG_RE.sub("", text)
+
+
 class TmuxViewerScreen(ModalScreen[None]):
     """Modal screen to view live tmux output from active Claude sessions."""
 
@@ -160,6 +183,7 @@ class TmuxViewerScreen(ModalScreen[None]):
         self.tmux = tmux
         self.session_names = session_names
         self._timer: Any = None
+        self._last_content: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tmux-dialog"):
@@ -181,23 +205,38 @@ class TmuxViewerScreen(ModalScreen[None]):
     async def on_mount(self) -> None:
         """Start polling tmux output."""
         await self._refresh_output()
-        self._timer = self.set_interval(1.0, self._refresh_output)
+        self._timer = self.set_interval(0.5, self._refresh_output)
 
     async def _refresh_output(self) -> None:
-        """Capture and display tmux pane content."""
+        """Capture and display tmux pane content (diff-based)."""
         log = self.query_one("#tmux-output", RichLog)
+
+        # Capture all sessions first
+        new_content: dict[str, str] = {}
+        for session_name in self.session_names:
+            try:
+                output = await self.tmux.capture_pane_color(session_name)
+                new_content[session_name] = output.rstrip()
+            except Exception as e:
+                new_content[session_name] = f"[red]Error capturing pane: {e}[/red]"
+
+        # Only re-render if content actually changed
+        if new_content == self._last_content:
+            return
+
         log.clear()
         for session_name in self.session_names:
             log.write(f"[bold cyan]━━━ {session_name} ━━━[/bold cyan]")
-            try:
-                output = await self.tmux.capture_pane(session_name)
-                if output.strip():
-                    log.write(output.rstrip())
-                else:
-                    log.write("[dim](empty)[/dim]")
-            except Exception as e:
-                log.write(f"[red]Error capturing pane: {e}[/red]")
+            content = new_content.get(session_name, "")
+            if content.strip():
+                # Strip ANSI background colors to avoid clashing with TUI bg,
+                # then convert remaining ANSI (foreground) to Rich Text
+                cleaned = _strip_ansi_bg(content)
+                log.write(Text.from_ansi(cleaned))
+            else:
+                log.write("[dim](empty)[/dim]")
             log.write("")
+        self._last_content = new_content
 
     @on(Button.Pressed, "#close-tmux")
     def action_close(self) -> None:

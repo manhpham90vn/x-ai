@@ -444,7 +444,7 @@ class AgentRunner:
         await asyncio.sleep(min_wait)
 
         # Phase 2: Poll for result file + handle confirmations
-        poll_interval = 2.0
+        poll_interval = 1.0
         last_yielded_lines: list[str] = []
 
         while time.monotonic() - start < timeout:
@@ -476,26 +476,17 @@ class AgentRunner:
                 except (OSError, UnicodeDecodeError):
                     pass  # File may be partially written
 
-            # Stream colored output if a callback is provided
-            if stream_callback:
-                colored_output = await self.tmux.capture_pane_color(session_name)
-                # Split by \n to manage line diffs
-                current_lines = colored_output.rstrip("\n").split("\n")
+            # Single capture for both streaming and confirmation monitoring
+            output = await self.tmux.capture_pane(session_name)
 
-                # Simple diffing: find the first line that
-                # diverges or just append new ones.
-                # Since tmux pane buffers can scroll, finding
-                # an exact overlap can be tricky, but matching
-                # from the bottom up or finding the longest
-                # prefix overlap works best for tails.
-                # For simplicity, if screen size is fixed, we
-                # find where last_yielded matches current.
+            # Stream output if callback provided
+            if stream_callback:
+                current_lines = output.rstrip("\n").split("\n")
 
                 if current_lines != last_yielded_lines:
                     # Find overlap
                     match_idx = 0
                     for i in range(len(current_lines)):
-                        # Look for last_yielded_lines[-1] in current_lines to resync
                         if (
                             last_yielded_lines
                             and current_lines[i] == last_yielded_lines[-1]
@@ -503,10 +494,8 @@ class AgentRunner:
                             match_idx = i + 1
                             break
 
-                    # If no overlap found, or first run, yield all current
+                    # If no overlap found, or first run, yield changed lines
                     if match_idx == 0 and last_yielded_lines:
-                        # Maybe screen cleared or scrolled completely
-                        # Just yield the new ones that don't match index by index
                         for i, line in enumerate(current_lines):
                             if (
                                 i >= len(last_yielded_lines)
@@ -519,8 +508,7 @@ class AgentRunner:
 
                     last_yielded_lines = current_lines
 
-            # Monitor tmux for confirmations (always use uncolored output)
-            output = await self.tmux.capture_pane(session_name)
+            # Monitor for confirmations using the same captured output
             if output.strip():
                 lines = output.strip().splitlines()
                 tail = "\n".join(lines[-10:]).lower() if lines else ""
