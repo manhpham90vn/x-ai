@@ -2,6 +2,19 @@
 
 **Multi-Agent AI Coding System** — An orchestrator that coordinates two specialized AI agents (Planner and Executor) to autonomously analyze codebases, plan changes, implement code, and self-review with iterative quality improvement.
 
+[![PyPI](https://img.shields.io/pypi/v/x-ai-orchestrator)](https://pypi.org/project/x-ai-orchestrator/)
+[![Python](https://img.shields.io/pypi/pyversions/x-ai-orchestrator)](https://pypi.org/project/x-ai-orchestrator/)
+[![License](https://img.shields.io/github/license/manhpham90vn/x-ai)](LICENSE)
+
+## Table of Contents
+
+- [What Problem Does x-ai Solve?](#what-problem-does-x-ai-solve)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Development](#development)
+- [License](#license)
+
 ## What Problem Does x-ai Solve?
 
 Coding with AI assistants today is a single-agent experience — you give one AI a prompt and hope it gets everything right on the first try. For complex tasks, this often fails because:
