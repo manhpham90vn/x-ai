@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shlex
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -322,21 +324,37 @@ class AgentRunner:
         self,
         session_name: str,
         prompt: str,
-    ) -> bool:
+    ) -> Path | None:
         """Inject a prompt into Claude's tmux session.
 
-        Always writes prompt to a temp file and tells Claude to read it,
+        Always writes prompt to a secure temp file and tells Claude to read it,
         avoiding shell escaping issues with send-keys for long text.
 
+        Uses tempfile.mkstemp for secure file creation to prevent race conditions.
+
         Steps:
-        1. Write prompt to /tmp file
+        1. Write prompt to secure temp file (atomically created)
         2. C-u (clear input)
         3. send-keys instruction to read the file
         4. C-m (Enter)
+
+        Returns:
+            Path to the prompt file, or None if failed.
         """
-        # Always use file-based prompt injection to avoid escaping issues
-        prompt_file = Path(f"/tmp/xai_prompt_{session_name}.txt")
-        prompt_file.write_text(prompt, encoding="utf-8")
+        # Use secure temp file creation to prevent race conditions
+        fd, prompt_path = tempfile.mkstemp(
+            prefix=f"xai_prompt_{session_name}_",
+            suffix=".txt",
+            dir="/tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            prompt_file = Path(prompt_path)
+        except OSError:
+            os.close(fd)
+            logger.error("Failed to create secure temp file for prompt")
+            return None
 
         instruction = (
             f"Read and follow ALL instructions in the file {prompt_file}. "
@@ -363,7 +381,7 @@ class AgentRunner:
 
         # Brief wait
         await asyncio.sleep(1)
-        return True
+        return prompt_file
 
     # ------------------------------------------------------------------
     # Wait for result file + handle runtime confirmations
@@ -424,17 +442,24 @@ class AgentRunner:
                     content = result_file.read_text(encoding="utf-8").strip()
                     if content and "---" in content:
                         # Result file has frontmatter — verify it's complete
-                        # Wait a moment to ensure file write is finished
-                        await asyncio.sleep(1)
-                        content2 = result_file.read_text(encoding="utf-8").strip()
-                        if content2 == content:
-                            elapsed = time.monotonic() - start
-                            logger.info(
-                                "Result file appeared: %s (%.1fs)",
-                                result_file.name,
-                                elapsed,
-                            )
-                            return True
+                        # Check for atomic write indicator (.tmp file doesn't exist)
+                        # or wait for stable content (file size stable)
+                        prev_size = result_file.stat().st_size
+                        await asyncio.sleep(0.5)
+                        curr_size = result_file.stat().st_size
+                        if curr_size == prev_size:
+                            # File size is stable, read final content
+                            final_content = result_file.read_text(
+                                encoding="utf-8"
+                            ).strip()
+                            if "---" in final_content:
+                                elapsed = time.monotonic() - start
+                                logger.info(
+                                    "Result file appeared: %s (%.1fs)",
+                                    result_file.name,
+                                    elapsed,
+                                )
+                                return True
                         # File still being written, continue polling
                 except (OSError, UnicodeDecodeError):
                     pass  # File may be partially written
@@ -507,6 +532,7 @@ class AgentRunner:
         timeout = self._get_timeout(role)
         result_file = task_file.parent / f"{task_id}.result.md"
         session_name = f"xai_{role}_{task_id[:8]}"
+        prompt_file: Path | None = None
 
         log_agent_start(f"claude:{role}", task_id)
 
@@ -524,7 +550,10 @@ class AgentRunner:
 
             # 3. Inject prompt (file-based)
             prompt = self._build_prompt(task_file, result_file, role)
-            await self._inject_prompt(session_name, prompt)
+            prompt_file = await self._inject_prompt(session_name, prompt)
+            if not prompt_file:
+                log_agent_done(f"claude:{role}", task_id, "error")
+                return AgentResult.error("Failed to inject prompt")
 
             # 4. Wait for result file on disk
             found = await self._wait_for_result_file(session_name, result_file, timeout)
@@ -544,8 +573,12 @@ class AgentRunner:
         finally:
             await self.tmux.kill(session_name)
             self._active_sessions.discard(session_name)
+            # Clean up the prompt temp file if it exists
+            if prompt_file is not None and prompt_file.exists():
+                prompt_file.unlink(missing_ok=True)
 
         # 5. Parse result file
         result = AgentResult.from_file(result_file)
+
         log_agent_done(f"claude:{role}", task_id, result.status)
         return result

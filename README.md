@@ -62,11 +62,11 @@ x-ai/
 │   ├── agent_runner.py        # Tmux session management & Claude interaction
 │   ├── models.py              # Data models (tasks, results, feedback)
 │   ├── config.py              # Configuration & environment variables
-│   └── logger.py              # Rich console logging
-├── skills/                    # Agent behavior definitions
-│   ├── planner.md             # Planner agent skill (plan + review)
-│   └── executor.md            # Executor agent skill (execute)
-├── requirements.txt
+│   ├── logger.py              # Rich console logging
+│   └── skills/                # Agent behavior definitions
+│       ├── planner.md         # Planner agent skill (plan + review)
+│       └── executor.md        # Executor agent skill (execute)
+├── pyproject.toml
 └── README.md
 ```
 
@@ -297,7 +297,7 @@ git clone https://github.com/manhpham90vn/x-ai.git
 cd x-ai
 python -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### Code Quality

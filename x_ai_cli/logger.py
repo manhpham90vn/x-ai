@@ -119,12 +119,14 @@ def log_agent_start(agent_type: str, task_id: str) -> None:
 
 def log_agent_done(agent_type: str, task_id: str, status: str) -> None:
     """Log when an agent finishes."""
-    style = "success" if status == "success" else "error"
+    # Handle both string and enum values
+    status_str = status.value if hasattr(status, "value") else status
+    style = "success" if status_str == "success" else "error"
     logger.info(
         "[agent]⚙ %s[/agent] finished %s → [%s]%s[/%s]",
         agent_type,
         task_id[:8],
         style,
-        status,
+        status_str,
         style,
     )
