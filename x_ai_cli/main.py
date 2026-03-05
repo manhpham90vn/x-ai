@@ -8,6 +8,7 @@ import contextlib
 import signal
 import sys
 import time
+from typing import Any
 
 from rich.panel import Panel
 from rich.table import Table
@@ -15,7 +16,7 @@ from rich.table import Table
 from x_ai_cli import __version__
 from x_ai_cli.config import Config
 from x_ai_cli.logger import console, logger, setup_logging
-from x_ai_cli.orchestrator import Orchestrator
+from x_ai_cli.orchestrator import Orchestrator, PipelineResult
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
 def get_prompt(args: argparse.Namespace) -> str:
     """Resolve the user prompt from CLI args."""
     if args.prompt:
-        return args.prompt
+        return str(args.prompt)
 
     console.print("[error]Error: provide a prompt[/error]")
     sys.exit(1)
@@ -83,7 +84,7 @@ def print_banner() -> None:
     )
 
 
-def print_result(result, elapsed: float) -> None:
+def print_result(result: PipelineResult, elapsed: float) -> None:
     """Print the final result summary."""
     table = Table(title="Pipeline Result", border_style="cyan")
     table.add_column("Field", style="bold")
@@ -149,7 +150,7 @@ async def async_main(args: argparse.Namespace) -> int:
 
     # Setup robust signal handling for graceful shutdown
     loop = asyncio.get_running_loop()
-    main_task: asyncio.Task | None = None
+    main_task: asyncio.Task[Any] | None = None
     _shutting_down = False
 
     def _signal_handler() -> None:

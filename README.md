@@ -237,7 +237,7 @@ x-ai provides real-time progress via Rich console output:
 ```
 ╭──────────────────────────────────────────────╮
 │ x-ai — Planner-Executor AI Coding System     │
-│ v0.1.0                                       │
+│ v0.3.0                                       │
 ╰──────────────────────────────────────────────╯
 Prompt: Add JWT authentication...
 Work dir: /path/to/project
@@ -297,7 +297,7 @@ git clone https://github.com/manhpham90vn/x-ai.git
 cd x-ai
 python -m venv venv
 source venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ### Code Quality
@@ -314,6 +314,9 @@ ruff format x_ai_cli/
 
 # Check formatting without changes
 ruff format --check x_ai_cli/
+
+# Type checking
+mypy x_ai_cli/
 ```
 
 ### Customizing Agent Behavior
