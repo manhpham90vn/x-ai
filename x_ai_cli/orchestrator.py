@@ -32,6 +32,7 @@ from x_ai_cli.models import (
     AgentTask,
     Feedback,
     ReviewResult,
+    TaskType,
 )
 
 
@@ -186,7 +187,7 @@ class Orchestrator:
     ) -> AgentResult:
         """Phase 1: Ask the Planner to analyze repo and create a plan."""
         task = AgentTask(
-            task_type="plan",
+            task_type=TaskType.PLAN,
             work_dir=str(self.config.work_path),
             round=round_num,
             instructions=user_request,
@@ -203,7 +204,7 @@ class Orchestrator:
     ) -> AgentResult:
         """Phase 2: Ask the Executor to implement code following the plan."""
         task = AgentTask(
-            task_type="execute",
+            task_type=TaskType.EXECUTE,
             work_dir=str(self.config.work_path),
             round=round_num,
             instructions="Follow the implementation plan below.",
@@ -243,7 +244,7 @@ class Orchestrator:
         )
 
         task = AgentTask(
-            task_type="review",
+            task_type=TaskType.REVIEW,
             work_dir=str(self.config.work_path),
             round=round_num,
             instructions=instructions,
@@ -270,23 +271,41 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _build_feedback(self, review: ReviewResult) -> Feedback:
-        """Build structured feedback for the next round."""
+        """Build structured feedback for the next round with deduplication."""
         feedback = Feedback(previous_score=review.score)
 
         # Extract issues from review notes
         if review.review_notes:
             lines = review.review_notes.split("\n")
+            seen_issues: set[str] = set()
+
+            # Keywords + minimum line length to reduce false
+            # positives
+            issue_keywords = ["fix", "issue", "bug", "missing", "add", "error"]
+
             for line in lines:
                 line_stripped = line.strip().lstrip("- ").lstrip("* ")
-                if (
-                    any(
-                        kw in line.lower()
-                        for kw in ["fix", "issue", "bug", "missing", "add", "error"]
+
+                # Skip empty or very short lines
+                if len(line_stripped) < 10:
+                    continue
+
+                # Check for issue indicators with case-insensitive matching
+                line_lower = line.lower()
+                has_issue_keyword = any(kw in line_lower for kw in issue_keywords)
+
+                if has_issue_keyword:
+                    # Normalize for deduplication
+                    normalized = " ".join(line_stripped.lower().split())
+
+                    # Skip if we've already seen this issue (or a very similar one)
+                    is_duplicate = any(
+                        normalized in seen or seen in normalized for seen in seen_issues
                     )
-                    and line_stripped
-                    and len(line_stripped) > 10
-                ):
-                    feedback.mandatory_fixes.append(line_stripped)
+
+                    if not is_duplicate:
+                        feedback.mandatory_fixes.append(line_stripped)
+                        seen_issues.add(normalized)
 
         # Score gaps
         if review.score < self.config.quality_threshold:

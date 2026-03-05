@@ -14,10 +14,41 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# ---------------------------------------------------------------------------
+# Enum constants for status values
+# ---------------------------------------------------------------------------
+
+
+class TaskStatus(StrEnum):
+    """Task status values."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class AgentStatus(StrEnum):
+    """Agent result status values."""
+
+    SUCCESS = "success"
+    ERROR = "error"
+    PARTIAL = "partial"
+
+
+class TaskType(StrEnum):
+    """Task type values."""
+
+    PLAN = "plan"
+    EXECUTE = "execute"
+    REVIEW = "review"
+
 
 # ---------------------------------------------------------------------------
 # YAML Frontmatter helpers
@@ -70,7 +101,7 @@ class Task:
 
     id: str = field(default_factory=new_id)
     original_request: str = ""
-    status: str = "pending"  # pending | in_progress | completed | failed
+    status: TaskStatus = field(default=TaskStatus.PENDING)
     current_round: int = 0
     created_at: str = field(default_factory=now_iso)
 
@@ -88,7 +119,7 @@ class AgentTask:
     """
 
     id: str = field(default_factory=new_id)
-    task_type: str = "execute"  # plan | execute | review
+    task_type: TaskType = field(default=TaskType.EXECUTE)
     work_dir: str = "."
     round: int = 1
     parent_task_id: str | None = None
@@ -100,7 +131,7 @@ class AgentTask:
     def to_markdown(self) -> str:
         meta: dict[str, Any] = {
             "id": self.id,
-            "type": self.task_type,
+            "type": self.task_type.value,
             "work_dir": self.work_dir,
             "round": self.round,
             "parent_task_id": self.parent_task_id,
@@ -135,7 +166,7 @@ class AgentResult:
     """Parsed result from an agent's `{task_id}.result.md`."""
 
     id: str = ""
-    status: str = "error"  # success | error | partial
+    status: AgentStatus = field(default=AgentStatus.ERROR)
     score: float | None = None
     round: int = 1
     files_changed: list[str] = field(default_factory=list)
@@ -146,14 +177,23 @@ class AgentResult:
     def from_file(cls, path: Path) -> AgentResult:
         """Parse a result.md file into an AgentResult."""
         if not path.exists():
-            return cls(status="error", error_message=f"Result file not found: {path}")
+            return cls(
+                status=AgentStatus.ERROR, error_message=f"Result file not found: {path}"
+            )
 
         text = path.read_text(encoding="utf-8")
         meta, body = parse_frontmatter(text)
 
+        # Parse status with fallback to ERROR
+        status_str = meta.get("status", "error")
+        try:
+            status = AgentStatus(status_str)
+        except ValueError:
+            status = AgentStatus.ERROR
+
         return cls(
             id=meta.get("id", ""),
-            status=meta.get("status", "error"),
+            status=status,
             score=meta.get("score"),
             round=meta.get("round", 1),
             files_changed=meta.get("files_changed", []) or [],
@@ -164,7 +204,7 @@ class AgentResult:
     @classmethod
     def error(cls, message: str) -> AgentResult:
         """Create an error result."""
-        return cls(status="error", error_message=message)
+        return cls(status=AgentStatus.ERROR, error_message=message)
 
 
 @dataclass

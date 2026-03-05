@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-ai-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-Agent AI Coding System — Planner-Executor orchestrator for Claude CLI"
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -45,7 +45,7 @@ class Config:
         self._work_path = Path(self.work_dir).resolve()
         self._tasks_path = self._work_path / self.tasks_dir
         self._logs_path = self._work_path / self.logs_dir
-        self._skills_path = Path(__file__).parent.parent / "skills"
+        self._skills_path = Path(__file__).parent / "skills"
 
     @property
     def work_path(self) -> Path:
