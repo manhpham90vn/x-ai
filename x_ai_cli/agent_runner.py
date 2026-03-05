@@ -1,17 +1,19 @@
 """Agent subprocess launcher for x-ai CLI orchestrator.
 
-Launches Claude CLI instances as workers using tmux sessions for process
-management and git worktrees for filesystem isolation.
+Launches Claude CLI instances in interactive mode inside tmux sessions.
+Controls them natively via tmux send-keys — following the approach from
+Claude-Code-Remote's tmux-injector.js.
 
-All agents are Claude CLI:
-- Leader: `claude -p` (headless, captures stdout directly)
-- Workers: `claude -p --worktree` inside tmux sessions (parallel, isolated)
+Key patterns (from tmux-injector.js):
+- Create session WITH claude command: tmux new-session -d -s name claude ...
+- Inject: C-u → send-keys 'escaped_text' → C-m  (via shell exec)
+- Confirmations: poll capture-pane, detect prompts, auto-answer
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import shlex
 import shutil
 import time
 from pathlib import Path
@@ -20,21 +22,39 @@ from x_ai_cli.config import Config
 from x_ai_cli.logger import logger, log_agent_start, log_agent_done
 from x_ai_cli.models import AgentResult, parse_frontmatter, write_frontmatter
 
-# Poll interval when waiting for tmux command to finish
-_POLL_INTERVAL_SEC = 2
-
 
 class TmuxSession:
-    """Manages a single tmux session for running commands."""
+    """Manages tmux sessions — mirrors tmux-injector.js approach.
+
+    Uses shell execution (create_subprocess_shell) for send-keys commands
+    so that single-quote escaping works correctly, exactly like the JS
+    version's exec() calls.
+    """
 
     def __init__(self, tmux_bin: str = "tmux") -> None:
         self.tmux_bin = tmux_bin
 
-    async def _run(self, *args: str) -> tuple[int, str, str]:
-        """Run a tmux subcommand and return (returncode, stdout, stderr)."""
-        cmd = [self.tmux_bin, *args]
+    async def _shell(self, cmd: str) -> tuple[int, str, str]:
+        """Run a shell command and return (returncode, stdout, stderr).
+
+        Uses shell execution — same as Node.js exec() in tmux-injector.js.
+        """
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        return (
+            proc.returncode or 0,
+            stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
+            stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else "",
+        )
+
+    async def _exec(self, *args: str) -> tuple[int, str, str]:
+        """Run a command directly (no shell) and return (returncode, stdout, stderr)."""
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -47,17 +67,42 @@ class TmuxSession:
 
     async def exists(self, session_name: str) -> bool:
         """Check if a tmux session exists."""
-        rc, _, _ = await self._run("has-session", "-t", session_name)
+        rc, _, _ = await self._shell(
+            f"{self.tmux_bin} has-session -t {shlex.quote(session_name)} 2>/dev/null"
+        )
         return rc == 0
 
-    async def create(self, session_name: str) -> bool:
-        """Create a new detached tmux session.
+    async def create_with_command(
+        self,
+        session_name: str,
+        command: str,
+        work_dir: str = ".",
+    ) -> bool:
+        """Create a tmux session that immediately runs a command.
 
-        Returns True if created successfully.
+        Mirrors tmux-injector.js createClaudeSession():
+            tmux new-session -d -s name -c cwd command
         """
-        rc, _, stderr = await self._run(
-            "new-session", "-d", "-s", session_name,
-            "-x", "250", "-y", "50",  # wide pane for full output
+        cmd = (
+            f"{self.tmux_bin} new-session -d"
+            f" -s {shlex.quote(session_name)}"
+            f" -x 250 -y 50"
+            f" -c {shlex.quote(work_dir)}"
+            f" {command}"
+        )
+        rc, _, stderr = await self._shell(cmd)
+        if rc != 0:
+            logger.error("Failed to create tmux session %s: %s", session_name, stderr)
+            return False
+        logger.debug("Created tmux session: %s (cmd: %s)", session_name, command)
+        return True
+
+    async def create(self, session_name: str) -> bool:
+        """Create a new detached tmux session (no command)."""
+        rc, _, stderr = await self._shell(
+            f"{self.tmux_bin} new-session -d"
+            f" -s {shlex.quote(session_name)}"
+            f" -x 250 -y 50"
         )
         if rc != 0:
             logger.error("Failed to create tmux session %s: %s", session_name, stderr)
@@ -65,82 +110,78 @@ class TmuxSession:
         logger.debug("Created tmux session: %s", session_name)
         return True
 
-    async def send_command(self, session_name: str, command: str) -> None:
-        """Send a command string to the tmux session."""
-        # Use send-keys to type the command and press Enter
-        await self._run("send-keys", "-t", session_name, command, "Enter")
+    async def send_keys_raw(self, session_name: str, keys: str) -> None:
+        """Send raw keys (control sequences like C-u, C-m, Down, Enter).
 
-    async def capture_output(self, session_name: str) -> str:
-        """Capture the full scrollback buffer from the tmux pane."""
-        _, stdout, _ = await self._run(
-            "capture-pane", "-t", session_name,
-            "-p",       # print to stdout
-            "-S", "-",  # start from beginning of scrollback
+        These are NOT quoted — tmux interprets them as key names.
+        """
+        cmd = f"{self.tmux_bin} send-keys -t {shlex.quote(session_name)} {keys}"
+        await self._shell(cmd)
+
+    async def send_text(self, session_name: str, text: str) -> None:
+        """Send literal text to tmux session.
+
+        Mirrors tmux-injector.js injectCommand():
+            tmux send-keys -t session 'escaped_text'
+
+        Uses single-quote shell escaping (replace ' with '"'"')
+        so tmux receives the text literally, not as key names.
+        """
+        # Shell single-quote escape: replace ' with '"'"'
+        escaped = text.replace("'", "'\"'\"'")
+        cmd = f"{self.tmux_bin} send-keys -t {shlex.quote(session_name)} '{escaped}'"
+        await self._shell(cmd)
+
+    async def capture_pane(self, session_name: str) -> str:
+        """Capture visible pane content.
+
+        Mirrors tmux-injector.js getCaptureOutput():
+            tmux capture-pane -t session -p
+        """
+        _, stdout, _ = await self._shell(
+            f"{self.tmux_bin} capture-pane -t {shlex.quote(session_name)} -p"
         )
         return stdout
 
-    async def capture_full_output(self, session_name: str) -> str:
-        """Capture entire scrollback (up to 50000 lines) from tmux pane."""
-        _, stdout, _ = await self._run(
-            "capture-pane", "-t", session_name,
-            "-p",            # print to stdout
-            "-S", "-50000",  # large scrollback
-            "-J",            # join wrapped lines
+    async def capture_full(self, session_name: str) -> str:
+        """Capture entire scrollback (up to 50000 lines)."""
+        _, stdout, _ = await self._shell(
+            f"{self.tmux_bin} capture-pane -t {shlex.quote(session_name)}"
+            f" -p -S -50000 -J"
         )
         return stdout
 
     async def kill(self, session_name: str) -> None:
         """Kill a tmux session."""
-        await self._run("kill-session", "-t", session_name)
+        await self._shell(
+            f"{self.tmux_bin} kill-session -t {shlex.quote(session_name)} 2>/dev/null"
+        )
         logger.debug("Killed tmux session: %s", session_name)
 
 
 class AgentRunner:
-    """Launches and manages Claude CLI agent instances."""
+    """Launches and manages Claude CLI agents via native tmux control.
+
+    Follows the tmux-injector.js approach from Claude-Code-Remote:
+    1. Create session with claude command
+    2. Handle startup prompts (bypass permissions, trust folder)
+    3. Inject prompts: C-u → send-keys 'text' → C-m
+    4. Poll capture-pane for completion
+    5. Handle confirmations automatically
+    """
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.tmux = TmuxSession(config.tmux_bin)
         self._active_sessions: set[str] = set()
 
-    @staticmethod
-    def _parse_stream_json_output(raw: str) -> str:
-        """Extract final text from Claude stream-json output in tmux scrollback.
-
-        Parses line-delimited JSON events captured from tmux.
-        Returns the `result` field from the final 'result' event,
-        or concatenated text blocks from 'assistant' events as fallback.
-        """
-        result_text = ""
-        text_parts: list[str] = []
-
-        for line in raw.strip().splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            evt_type = event.get("type")
-            if evt_type == "result":
-                result_text = event.get("result", "")
-            elif evt_type == "assistant":
-                msg = event.get("message", {})
-                for block in msg.get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block["text"])
-
-        return result_text or "\n".join(text_parts)
-
-
-
     async def cleanup_all(self) -> None:
         """Kill all active tmux sessions. Called on Ctrl+C / shutdown."""
         if not self._active_sessions:
             return
-        logger.info("Cleaning up %d active tmux session(s)...", len(self._active_sessions))
+        logger.info(
+            "Cleaning up %d active tmux session(s)...", len(self._active_sessions)
+        )
         for session_name in list(self._active_sessions):
             try:
                 await self.tmux.kill(session_name)
@@ -173,39 +214,320 @@ class AgentRunner:
             f"Include id, status, and other required fields in the frontmatter."
         )
 
-    def _build_claude_args(
-        self,
-        prompt: str,
-        worktree_name: str | None = None,
-    ) -> list[str]:
-        """Build claude CLI arguments."""
-        args = [
-            self.config.claude_bin,
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-        ]
-        if worktree_name and self.config.use_worktree:
-            args.extend(["--worktree", worktree_name])
-        return args
-
     def _get_timeout(self, role: str) -> int:
         """Get timeout seconds based on agent role."""
         if role == "leader":
             return self.config.leader_timeout_sec
         return self.config.worker_timeout_sec
 
-    def _parse_stdout_to_result(self, task_id: str, stdout: str) -> AgentResult:
-        """Parse agent stdout into an AgentResult.
+    # ------------------------------------------------------------------
+    # Session lifecycle (mirrors tmux-injector.js)
+    # ------------------------------------------------------------------
 
-        Tries to extract YAML frontmatter from stdout.
-        Falls back to wrapping raw stdout as result body.
+    async def _create_claude_session(
+        self,
+        session_name: str,
+        worktree_name: str | None = None,
+    ) -> bool:
+        """Create a tmux session and launch Claude interactive mode inside it.
+
+        2-step approach (because `tmux new-session -d -s name command` runs
+        the command WITHOUT a shell, so Claude exits immediately):
+        1. Create empty tmux session
+        2. send-keys to launch Claude inside the shell
         """
-        stdout = stdout.strip()
-        if not stdout:
+        # Step 1: Create empty session
+        created = await self.tmux.create(session_name)
+        if not created:
+            return False
+
+        self._active_sessions.add(session_name)
+
+        # Step 2: cd to work_dir and launch Claude
+        cmd_parts = [self.config.claude_bin, "--dangerously-skip-permissions"]
+        if worktree_name and self.config.use_worktree:
+            cmd_parts.extend(["--worktree", worktree_name])
+
+        launch_cmd = (
+            f"cd {shlex.quote(str(self.config.work_path))} && {' '.join(cmd_parts)}"
+        )
+
+        await self.tmux.send_text(session_name, launch_cmd)
+        await asyncio.sleep(0.2)
+        await self.tmux.send_keys_raw(session_name, "C-m")
+
+        # Wait for Claude to initialize
+        await asyncio.sleep(5)
+
+        return True
+
+    async def _handle_startup_prompts(
+        self,
+        session_name: str,
+        timeout: int = 60,
+    ) -> bool:
+        """Handle Claude startup prompts, wait for ready.
+
+        Mirrors tmux-injector.js handleConfirmations() — polls capture-pane
+        and auto-answers prompts:
+
+        1. Bypass Permissions warning → send Down + Enter (select "Yes, I accept")
+        2. Trust folder prompt → send Enter (default is "Yes")
+        3. Other Y/N → send 'y' + Enter
+        4. "Enter to confirm" → send Enter
+
+        Returns True when prompt marker (❯) appears.
+        """
+        marker = self.config.prompt_marker
+        start = time.monotonic()
+        max_attempts = 30  # like tmux-injector.js maxAttempts
+
+        for attempt in range(1, max_attempts + 1):
+            if time.monotonic() - start > timeout:
+                break
+
+            output = await self.tmux.capture_pane(session_name)
+            if not output.strip():
+                await asyncio.sleep(self.config.poll_interval_sec)
+                continue
+
+            last_lines = output.strip().splitlines()[-10:]
+            tail = "\n".join(last_lines)
+            tail_lower = tail.lower()
+
+            # Check: Bypass Permissions warning PROMPT (the actual dialog)
+            # Must distinguish from status bar "⏵⏵ bypass permissions on"
+            # The PROMPT has "No, exit" and "Yes, I accept" options
+            if "no, exit" in tail_lower and "yes, i accept" in tail_lower:
+                logger.info("Bypass Permissions prompt detected (attempt %d)", attempt)
+                await self.tmux.send_keys_raw(session_name, "Down")
+                await asyncio.sleep(0.3)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(2)
+                continue
+
+            # Check: Trust folder prompt (default = "Yes")
+            # → just Enter
+            if "trust this folder" in tail_lower or "safety check" in tail_lower:
+                logger.info("Trust folder prompt detected (attempt %d)", attempt)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(2)
+                continue
+
+            # Check: Multi-option confirmation (like tmux-injector.js)
+            # → select option 2 "Yes, and don't ask again"
+            if "do you want to proceed?" in tail_lower and "1. yes" in tail_lower:
+                logger.info("Multi-option confirmation detected (attempt %d)", attempt)
+                await self.tmux.send_text(session_name, "2")
+                await asyncio.sleep(0.3)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(2)
+                continue
+
+            # Check: Single Y/N prompt
+            if "(y/n)" in tail_lower or "[y/n]" in tail_lower:
+                logger.info("Y/N prompt detected (attempt %d)", attempt)
+                await self.tmux.send_text(session_name, "y")
+                await asyncio.sleep(0.3)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(1)
+                continue
+
+            # Check: "Enter to confirm" / "Press Enter"
+            if "enter to confirm" in tail_lower or "press enter" in tail_lower:
+                logger.info("Enter prompt detected (attempt %d)", attempt)
+                await self.tmux.send_keys_raw(session_name, "Enter")
+                await asyncio.sleep(1)
+                continue
+
+            # Check: Claude is ready (prompt marker ❯ anywhere in last lines)
+            # Note: ❯ is NOT on the very last line — it's above the
+            # status bar "⏵⏵ bypass permissions on (shift+tab to cycle)"
+            for line in last_lines:
+                if marker in line and "bypass" not in line.lower():
+                    elapsed = time.monotonic() - start
+                    logger.info(
+                        "Claude ready in session %s (%.1fs, %d attempts)",
+                        session_name,
+                        elapsed,
+                        attempt,
+                    )
+                    return True
+
+            # Check: Still loading
+            if any(w in tail_lower for w in ["loading", "connecting", "starting"]):
+                logger.debug("Claude still loading (attempt %d)", attempt)
+
+            await asyncio.sleep(self.config.poll_interval_sec)
+
+        logger.error(
+            "Timed out waiting for Claude in %s after %ds", session_name, timeout
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # Command injection (mirrors tmux-injector.js injectCommand)
+    # ------------------------------------------------------------------
+
+    async def _inject_command(
+        self,
+        session_name: str,
+        command: str,
+    ) -> bool:
+        """Inject a command into Claude's tmux session.
+
+        Exact replica of tmux-injector.js injectCommand():
+        1. tmux send-keys -t session C-u          (clear input)
+        2. tmux send-keys -t session 'escaped'    (send text)
+        3. tmux send-keys -t session C-m          (press Enter)
+
+        For long commands (>4000 chars), writes to file and sends
+        a reference instruction instead.
+        """
+        # Step 1: Clear input field
+        await self.tmux.send_keys_raw(session_name, "C-u")
+        await asyncio.sleep(0.2)
+
+        # Step 2: Send command text
+        if len(command) > 4000:
+            # Long command → write to file, send read instruction
+            prompt_file = Path(f"/tmp/xai_prompt_{session_name}.txt")
+            prompt_file.write_text(command, encoding="utf-8")
+            instruction = (
+                f"Read and follow ALL instructions in the file {prompt_file}. "
+                f"Output your result exactly as described in the instructions."
+            )
+            await self.tmux.send_text(session_name, instruction)
+            logger.debug(
+                "Sent file-based prompt (%d chars → %s) to %s",
+                len(command),
+                prompt_file.name,
+                session_name,
+            )
+        else:
+            await self.tmux.send_text(session_name, command)
+            logger.debug("Sent prompt (%d chars) to %s", len(command), session_name)
+
+        await asyncio.sleep(0.2)
+
+        # Step 3: Press Enter (C-m)
+        await self.tmux.send_keys_raw(session_name, "C-m")
+
+        # Brief wait then verify (like tmux-injector.js)
+        await asyncio.sleep(1)
+        output = await self.tmux.capture_pane(session_name)
+        logger.debug("State after inject: %s", output.strip()[-200:].replace("\n", " "))
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Wait for response + handle runtime confirmations
+    # ------------------------------------------------------------------
+
+    async def _wait_for_response(
+        self,
+        session_name: str,
+        timeout: int,
+    ) -> str | None:
+        """Wait for Claude to finish responding.
+
+        Polls capture-pane. Claude is done when:
+        - Prompt marker (❯) reappears in last line
+        - While waiting, auto-handles any runtime confirmations
+
+        Returns the full captured output, or None on timeout.
+        """
+        marker = self.config.prompt_marker
+
+        # Wait a bit for Claude to start processing
+        await asyncio.sleep(3)
+
+        start = time.monotonic()
+        logger.info("Waiting for response in %s (timeout: %ds)", session_name, timeout)
+
+        while time.monotonic() - start < timeout:
+            output = await self.tmux.capture_pane(session_name)
+            lines = output.strip().splitlines() if output.strip() else []
+
+            # Handle runtime confirmations (like tmux-injector.js handleConfirmations)
+            if lines:
+                tail_lower = "\n".join(lines[-5:]).lower()
+
+                # Auto-accept runtime confirmations
+                if "do you want to proceed?" in tail_lower:
+                    logger.info("Runtime confirmation detected, auto-accepting")
+                    await self.tmux.send_text(session_name, "2")
+                    await asyncio.sleep(0.3)
+                    await self.tmux.send_keys_raw(session_name, "Enter")
+                    await asyncio.sleep(2)
+                    continue
+
+                if "(y/n)" in tail_lower or "[y/n]" in tail_lower:
+                    logger.info("Runtime Y/N prompt, sending 'y'")
+                    await self.tmux.send_text(session_name, "y")
+                    await asyncio.sleep(0.3)
+                    await self.tmux.send_keys_raw(session_name, "Enter")
+                    await asyncio.sleep(1)
+                    continue
+
+            # Check if Claude is done (prompt marker reappears)
+            # ❯ is NOT on the very last line — status bar is below it
+            for line in lines[-5:] if lines else []:
+                if marker in line and "bypass" not in line.lower():
+                    elapsed = time.monotonic() - start
+                    logger.info(
+                        "Response completed in %s (%.1fs)", session_name, elapsed
+                    )
+                    return await self.tmux.capture_full(session_name)
+
+            await asyncio.sleep(self.config.poll_interval_sec)
+
+        logger.warning("Timed out waiting for response in %s", session_name)
+        return await self.tmux.capture_full(session_name)
+
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
+
+    def _extract_response(self, full_output: str) -> str:
+        """Extract Claude's response from tmux scrollback.
+
+        Finds text between the last two prompt markers (❯).
+        """
+        marker = self.config.prompt_marker
+        lines = full_output.strip().splitlines()
+
+        # Find last marker
+        last_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if marker in lines[i]:
+                last_idx = i
+                break
+
+        if last_idx <= 0:
+            return full_output.strip()
+
+        # Find second-to-last marker
+        prev_idx = -1
+        for i in range(last_idx - 1, -1, -1):
+            if marker in lines[i]:
+                prev_idx = i
+                break
+
+        if prev_idx >= 0:
+            response_lines = lines[prev_idx + 1 : last_idx]
+        else:
+            response_lines = lines[:last_idx]
+
+        return "\n".join(response_lines).strip()
+
+    def _parse_response_to_result(self, task_id: str, response: str) -> AgentResult:
+        """Parse Claude's text response into an AgentResult."""
+        response = response.strip()
+        if not response:
             return AgentResult.error("Agent produced no output")
 
-        # Try parsing frontmatter from stdout
-        meta, body = parse_frontmatter(stdout)
+        meta, body = parse_frontmatter(response)
 
         if meta:
             return AgentResult(
@@ -221,13 +543,11 @@ class AgentRunner:
             return AgentResult(
                 id=task_id,
                 status="success",
-                body=stdout,
+                body=response,
             )
 
-    def _save_result_file(
-        self, result: AgentResult, result_file: Path,
-    ) -> None:
-        """Save an AgentResult to a .result.md file for audit."""
+    def _save_result_file(self, result: AgentResult, result_file: Path) -> None:
+        """Save an AgentResult to .result.md for audit."""
         result_md = write_frontmatter(
             {
                 "id": result.id,
@@ -242,23 +562,17 @@ class AgentRunner:
         logger.debug("Saved result to %s", result_file.name)
 
     # ------------------------------------------------------------------
-    # Leader: tmux session (observable via tmux attach)
+    # Leader (mirrors tmux-injector.js injectCommandFull)
     # ------------------------------------------------------------------
 
     async def run_leader(self, task_file: Path) -> AgentResult:
-        """Run Claude Code as Leader agent in a tmux session.
-
-        Uses the same tmux + runner.sh pattern as workers so the user
-        can attach and observe the leader's output in real-time.
-        """
+        """Run Claude as Leader in native interactive tmux session."""
         for binary, label in [
             (self.config.claude_bin, "claude"),
             (self.config.tmux_bin, "tmux"),
         ]:
             if not shutil.which(binary):
-                msg = f"{label} binary not found: {binary}"
-                logger.error(msg)
-                return AgentResult.error(msg)
+                return AgentResult.error(f"{label} binary not found: {binary}")
 
         task_id = task_file.stem.replace(".task", "")
         timeout = self._get_timeout("leader")
@@ -268,80 +582,52 @@ class AgentRunner:
         log_agent_start("claude:leader", task_id)
 
         try:
-            # 1. Create tmux session
-            created = await self.tmux.create(session_name)
+            # 1. Create session with Claude (like createClaudeSession)
+            created = await self._create_claude_session(session_name)
             if not created:
-                msg = f"Failed to create tmux session: {session_name}"
-                return AgentResult.error(msg)
-            self._active_sessions.add(session_name)
+                return AgentResult.error(f"Failed to create session: {session_name}")
 
-            # 2. Build runner script — run Claude directly (no pipes)
+            # 2. Handle startup prompts (like handleConfirmations)
+            ready = await self._handle_startup_prompts(session_name)
+            if not ready:
+                log_agent_done("claude:leader", task_id, "error")
+                return AgentResult.error(f"Claude failed to start in {session_name}")
+
+            # 3. Inject prompt (like injectCommand)
             prompt = self._build_prompt(task_file, "leader")
-            prompt_file = task_file.parent / f"{task_id}.prompt.txt"
-            prompt_file.write_text(prompt, encoding="utf-8")
+            await self._inject_command(session_name, prompt)
 
-            done_flag = task_file.parent / f"{task_id}.done"
-            done_flag.unlink(missing_ok=True)
+            # 4. Wait for response (+ handle runtime confirmations)
+            raw_output = await self._wait_for_response(session_name, timeout)
+            if raw_output is None:
+                log_agent_done("claude:leader", task_id, "timeout")
+                return AgentResult.error(f"claude:leader timed out after {timeout}s")
 
-            runner_script = task_file.parent / f"{task_id}.runner.sh"
-            runner_script.write_text(
-                f'#!/bin/bash\n'
-                f'cd "{self.config.work_path}"\n'
-                f'cat \'{prompt_file}\' | {self.config.claude_bin} -p -'
-                f' --dangerously-skip-permissions'
-                f' --output-format stream-json --verbose\n'
-                f'touch "{done_flag}"\n',
-                encoding="utf-8",
-            )
-            runner_script.chmod(0o755)
-
-            # 3. Run in tmux — user can `tmux attach` to watch live
-            await self.tmux.send_command(session_name, f"bash '{runner_script}'")
-
-            # 4. Poll for completion
-            completed = await self._wait_for_done_flag(done_flag, timeout)
-
-            # 5. Capture output from tmux scrollback and parse JSON
-            raw = await self.tmux.capture_full_output(session_name)
-            stdout = self._parse_stream_json_output(raw)
-            if not completed:
-                logger.warning("claude:leader timed out but partial output captured (%d chars)", len(stdout))
-
-            # 6. Clean up temp files
-            prompt_file.unlink(missing_ok=True)
-            done_flag.unlink(missing_ok=True)
-            runner_script.unlink(missing_ok=True)
+            # 5. Extract response
+            response = self._extract_response(raw_output)
 
         except Exception as e:
-            msg = f"claude:leader unexpected error: {e}"
-            logger.error(msg, exc_info=True)
+            logger.error("claude:leader error: %s", e, exc_info=True)
             log_agent_done("claude:leader", task_id, "error")
-            return AgentResult.error(msg)
+            return AgentResult.error(f"claude:leader error: {e}")
 
         finally:
             await self.tmux.kill(session_name)
             self._active_sessions.discard(session_name)
 
-        if not completed:
-            msg = f"claude:leader timed out after {timeout}s"
-            logger.error(msg)
-            log_agent_done("claude:leader", task_id, "timeout")
-            return AgentResult.error(msg)
-
-        # Check if agent wrote a result file directly
+        # Check if agent wrote a result file
         if result_file.exists():
             result = AgentResult.from_file(result_file)
             log_agent_done("claude:leader", task_id, result.status)
             return result
 
-        # Parse stdout as the result
-        result = self._parse_stdout_to_result(task_id, stdout)
+        result = self._parse_response_to_result(task_id, response)
         self._save_result_file(result, result_file)
         log_agent_done("claude:leader", task_id, result.status)
         return result
 
     # ------------------------------------------------------------------
-    # Workers: tmux sessions + optional git worktrees
+    # Workers
     # ------------------------------------------------------------------
 
     async def run_worker(
@@ -350,22 +636,13 @@ class AgentRunner:
         task_file: Path,
         run_id: str,
     ) -> AgentResult:
-        """Run a Claude worker in a tmux session with optional worktree isolation.
-
-        Args:
-            worker_name: e.g. "claude_worker_0"
-            task_file: Path to the .task.md file
-            run_id: Unique run identifier for session naming
-        """
-        # Preflight checks
+        """Run a Claude worker in native interactive tmux session."""
         for binary, label in [
             (self.config.claude_bin, "claude"),
             (self.config.tmux_bin, "tmux"),
         ]:
             if not shutil.which(binary):
-                msg = f"{label} binary not found: {binary}"
-                logger.error(msg)
-                return AgentResult.error(msg)
+                return AgentResult.error(f"{label} binary not found: {binary}")
 
         task_id = task_file.stem.replace(".task", "")
         timeout = self._get_timeout("worker")
@@ -376,122 +653,50 @@ class AgentRunner:
         log_agent_start(worker_name, task_id)
 
         try:
-            # 1. Create tmux session
-            created = await self.tmux.create(session_name)
+            created = await self._create_claude_session(session_name, worktree_name)
             if not created:
-                msg = f"Failed to create tmux session: {session_name}"
-                return AgentResult.error(msg)
-            self._active_sessions.add(session_name)
+                return AgentResult.error(f"Failed to create session: {session_name}")
 
-            # 2. Build runner script — run Claude directly (no pipes)
+            ready = await self._handle_startup_prompts(session_name)
+            if not ready:
+                log_agent_done(worker_name, task_id, "error")
+                return AgentResult.error(f"Claude failed to start in {session_name}")
+
             prompt = self._build_prompt(task_file, "worker")
-            prompt_file = task_file.parent / f"{task_id}.prompt.txt"
-            prompt_file.write_text(prompt, encoding="utf-8")
+            await self._inject_command(session_name, prompt)
 
-            done_flag = task_file.parent / f"{task_id}.done"
-            done_flag.unlink(missing_ok=True)
+            raw_output = await self._wait_for_response(session_name, timeout)
+            if raw_output is None:
+                log_agent_done(worker_name, task_id, "timeout")
+                return AgentResult.error(f"{worker_name} timed out after {timeout}s")
 
-            worktree_arg = f' --worktree {worktree_name}' if worktree_name and self.config.use_worktree else ''
-            runner_script = task_file.parent / f"{task_id}.runner.sh"
-            runner_script.write_text(
-                f'#!/bin/bash\n'
-                f'cd "{self.config.work_path}"\n'
-                f'cat \'{prompt_file}\' | {self.config.claude_bin} -p -'
-                f' --dangerously-skip-permissions'
-                f'{worktree_arg}'
-                f' --output-format stream-json --verbose\n'
-                f'touch "{done_flag}"\n',
-                encoding="utf-8",
-            )
-            runner_script.chmod(0o755)
-
-            # Send command to tmux — user can `tmux attach` to watch
-            await self.tmux.send_command(session_name, f"bash '{runner_script}'")
-
-            # 3. Poll for completion (wait for done flag)
-            completed = await self._wait_for_done_flag(done_flag, timeout)
-
-            # 4. Capture output from tmux scrollback and parse JSON
-            raw = await self.tmux.capture_full_output(session_name)
-            stdout = self._parse_stream_json_output(raw)
-            if not completed and stdout:
-                logger.warning("%s timed out but partial output captured (%d chars)",
-                               worker_name, len(stdout))
-
-            # 5. Clean up temp files
-            prompt_file.unlink(missing_ok=True)
-            done_flag.unlink(missing_ok=True)
-            runner_script.unlink(missing_ok=True)
+            response = self._extract_response(raw_output)
 
         except Exception as e:
-            msg = f"{worker_name} unexpected error: {e}"
-            logger.error(msg, exc_info=True)
+            logger.error("%s error: %s", worker_name, e, exc_info=True)
             log_agent_done(worker_name, task_id, "error")
-            return AgentResult.error(msg)
+            return AgentResult.error(f"{worker_name} error: {e}")
 
         finally:
-            # 6. Always clean up the tmux session
             await self.tmux.kill(session_name)
             self._active_sessions.discard(session_name)
 
-        if not completed:
-            msg = f"{worker_name} timed out after {timeout}s"
-            logger.error(msg)
-            log_agent_done(worker_name, task_id, "timeout")
-            return AgentResult.error(msg)
-
-        # Check if agent wrote a result file directly
         if result_file.exists():
             result = AgentResult.from_file(result_file)
             log_agent_done(worker_name, task_id, result.status)
             return result
 
-        # Parse captured output from file
-        result = self._parse_stdout_to_result(task_id, stdout)
+        result = self._parse_response_to_result(task_id, response)
         self._save_result_file(result, result_file)
         log_agent_done(worker_name, task_id, result.status)
         return result
-
-    async def _wait_for_done_flag(
-        self,
-        done_flag: Path,
-        timeout: int,
-    ) -> bool:
-        """Poll for the done flag file to appear.
-
-        Returns True if completed, False on timeout.
-        """
-        start = time.monotonic()
-        logger.info(
-            "Waiting for done flag %s (timeout: %ds)",
-            done_flag.name,
-            timeout,
-        )
-
-        while time.monotonic() - start < timeout:
-            if done_flag.exists():
-                elapsed = time.monotonic() - start
-                logger.info("Done flag detected after %.1fs", elapsed)
-                return True
-
-            await asyncio.sleep(_POLL_INTERVAL_SEC)
-
-        return False  # timeout
 
     async def run_workers_parallel(
         self,
         task_files: dict[str, Path],
         run_id: str,
     ) -> dict[str, AgentResult]:
-        """Run multiple Claude workers in parallel via tmux sessions.
-
-        Args:
-            task_files: Dict of {worker_name: task_file_path}
-            run_id: Unique run identifier
-
-        Returns:
-            Dict of {worker_name: AgentResult}
-        """
+        """Run multiple Claude workers in parallel via tmux sessions."""
         tasks = {
             worker_name: self.run_worker(worker_name, task_file, run_id)
             for worker_name, task_file in task_files.items()
@@ -505,7 +710,7 @@ class AgentRunner:
 
         for worker_name, result in zip(tasks.keys(), gathered):
             if isinstance(result, Exception):
-                logger.error("%s failed with exception: %s", worker_name, result)
+                logger.error("%s failed: %s", worker_name, result)
                 results[worker_name] = AgentResult.error(str(result))
             else:
                 results[worker_name] = result
