@@ -88,22 +88,22 @@ class TestEnums:
 
     def test_task_status_values(self) -> None:
         """Test TaskStatus enum values."""
-        assert TaskStatus.PENDING == "pending"
-        assert TaskStatus.IN_PROGRESS == "in_progress"
-        assert TaskStatus.COMPLETED == "completed"
-        assert TaskStatus.FAILED == "failed"
+        assert TaskStatus.PENDING.value == "pending"
+        assert TaskStatus.IN_PROGRESS.value == "in_progress"
+        assert TaskStatus.COMPLETED.value == "completed"
+        assert TaskStatus.FAILED.value == "failed"
 
     def test_agent_status_values(self) -> None:
         """Test AgentStatus enum values."""
-        assert AgentStatus.SUCCESS == "success"
-        assert AgentStatus.ERROR == "error"
-        assert AgentStatus.PARTIAL == "partial"
+        assert AgentStatus.SUCCESS.value == "success"
+        assert AgentStatus.ERROR.value == "error"
+        assert AgentStatus.PARTIAL.value == "partial"
 
     def test_task_type_values(self) -> None:
         """Test TaskType enum values."""
-        assert TaskType.PLAN == "plan"
-        assert TaskType.EXECUTE == "execute"
-        assert TaskType.REVIEW == "review"
+        assert TaskType.PLAN.value == "plan"
+        assert TaskType.EXECUTE.value == "execute"
+        assert TaskType.REVIEW.value == "review"
 
 
 class TestTask:

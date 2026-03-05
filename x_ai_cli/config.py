@@ -31,6 +31,10 @@ class Config:
     prompt_marker: str = "❯"  # Marker to detect Claude is ready for input
     poll_interval_sec: float = 1.0  # Interval for polling tmux output
 
+    # Greeting settings
+    greeting_enabled: bool = True
+    greeting_message: str = "Welcome to x-ai"
+
     # Logging
     verbose: bool = False
     log_to_file: bool = True

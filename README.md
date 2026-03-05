@@ -63,6 +63,9 @@ x-ai/
 │   ├── models.py              # Data models (tasks, results, feedback)
 │   ├── config.py              # Configuration & environment variables
 │   ├── logger.py              # Rich console logging
+│   ├── tui/                   # Textual-based interactive UI
+│   │   ├── app.py             # Main TUI application (XAITui, Screens)
+│   │   └── widgets.py         # Custom TUI components (ActionLog, etc.)
 │   └── skills/                # Agent behavior definitions
 │       ├── planner.md         # Planner agent skill (plan + review)
 │       └── executor.md        # Executor agent skill (execute)
@@ -176,26 +179,46 @@ pip install .
 
 ## Usage
 
-### Basic Usage
+### Run Modes
+
+x-ai can be run in two distinct modes depending on your workflow preferences.
+
+#### 1. Interactive GUI Mode (TUI)
+
+Launch the full-screen Textual interface to get complete insight into the execution process and provide prompts dynamically.
 
 ```bash
-# Run with a coding task
+# Launch the interactive TUI (no arguments)
+x-ai
+
+# You can still pass configuration flags, e.g., to set the working directory
+x-ai -d /path/to/project
+```
+
+#### 2. Single-shot CLI Mode
+
+Provide the prompt directly inline to bypass the TUI entirely. This mode streams logs straight to standard output and is ideal for quick fixes or scripting.
+
+```bash
+# Run in single-shot mode with a coding task
 x-ai "Add JWT authentication to the Flask API" -d /path/to/project
 
-# Short form
+# Short form for single-shot mode
 x-ai "Fix the login bug" -d ./my-app
 ```
 
 ### CLI Options
 
-| Flag           | Short | Default  | Description                                          |
-| -------------- | ----- | -------- | ---------------------------------------------------- |
-| `prompt`       | —     | required | The coding task to execute                           |
-| `--work-dir`   | `-d`  | `.`      | Working directory for the target project             |
-| `--max-rounds` | `-r`  | `3`      | Maximum retry rounds before returning best-effort    |
-| `--threshold`  | `-t`  | `70.0`   | Quality threshold score (0–100) to accept a solution |
-| `--verbose`    | `-v`  | `false`  | Enable debug-level logging                           |
-| `--version`    | `-V`  | —        | Show version and exit                                |
+| Flag                 | Short | Default  | Description                                          |
+| -------------------- | ----- | -------- | ---------------------------------------------------- |
+| `prompt`             | —     | optional | The coding task to execute (omit for interactive UI) |
+| `--work-dir`         | `-d`  | `.`      | Working directory for the target project             |
+| `--max-rounds`       | `-r`  | `3`      | Maximum retry rounds before returning best-effort    |
+| `--threshold`        | `-t`  | `70.0`   | Quality threshold score (0–100) to accept a solution |
+| `--planner-timeout`  | —     | `600`    | Planner agent timeout in seconds                     |
+| `--executor-timeout` | —     | `600`    | Executor agent timeout in seconds                    |
+| `--verbose`          | `-v`  | `false`  | Enable debug-level logging                           |
+| `--version`          | `-V`  | —        | Show version and exit                                |
 
 ### Examples
 
@@ -230,14 +253,31 @@ All CLI options can also be set via environment variables:
 | `XAI_PROMPT_MARKER`     | `❯`      | Prompt marker for Claude readiness detection |
 | `XAI_POLL_INTERVAL`     | `1.0`    | Filesystem polling interval (seconds)        |
 
-### Output
+### Interactive TUI
 
-x-ai provides real-time progress via Rich console output:
+![TUI Demo 1](docs/1.png)
+
+![TUI Demo 2](docs/2.png)
+
+![TUI Demo 3](docs/3.png)
+
+x-ai includes a rich, full-screen Terminal User Interface (TUI) built with [Textual](https://textual.textualize.io/). To launch it, simply run `x-ai` without any arguments.
+
+**TUI Features:**
+
+- **Real-time Logging:** View orchestrator events, Planner/Executor state changes, and task outcomes in a dynamic log panel.
+- **Tmux Integration (`t`):** Press `t` to open a built-in viewer that shows the live, raw terminal output of the Claude agents running in their background tmux panes.
+- **Settings Dialog (`c`):** Press `c` to configure pipeline settings (Threshold, Max Rounds, Working Directory) interactively before running a task.
+- **Interactive Prompting:** Type your coding task directly into the TUI and press Enter to kick off the planner-executor pipeline.
+
+### Single-Shot Output
+
+x-ai also provides real-time progress via Rich console output when running a direct prompt:
 
 ```
 ╭──────────────────────────────────────────────╮
 │ x-ai — Planner-Executor AI Coding System     │
-│ v0.3.0                                       │
+│ v0.4.0                                       │
 ╰──────────────────────────────────────────────╯
 Prompt: Add JWT authentication...
 Work dir: /path/to/project

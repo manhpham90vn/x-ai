@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from rich.panel import Panel
+from rich.prompt import FloatPrompt, IntPrompt, Prompt
 from rich.table import Table
 
 from x_ai_cli import __version__
@@ -50,6 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quality threshold score 0-100 (default: 70.0)",
     )
     parser.add_argument(
+        "--planner-timeout",
+        type=int,
+        default=600,
+        help="Planner agent timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
+        "--executor-timeout",
+        type=int,
+        default=600,
+        help="Executor agent timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -62,15 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"x-ai {__version__}",
     )
     return parser
-
-
-def get_prompt(args: argparse.Namespace) -> str:
-    """Resolve the user prompt from CLI args."""
-    if args.prompt:
-        return str(args.prompt)
-
-    console.print("[error]Error: provide a prompt[/error]")
-    sys.exit(1)
 
 
 def print_banner() -> None:
@@ -121,12 +125,32 @@ def print_result(result: PipelineResult, elapsed: float) -> None:
 
 
 async def async_main(args: argparse.Namespace) -> int:
-    prompt = get_prompt(args)
+    print_banner()
+
+    is_interactive = not args.prompt
+
+    if is_interactive:
+        console.print(
+            "[dim]Welcome to x-ai interactive mode. Press Ctrl+C to exit.[/dim]\n"
+        )
+
+        args.work_dir = Prompt.ask(
+            "[bold cyan]? Work directory[/bold cyan]", default=args.work_dir
+        )
+        args.max_rounds = IntPrompt.ask(
+            "[bold cyan]? Max retry rounds[/bold cyan]", default=args.max_rounds
+        )
+        args.threshold = FloatPrompt.ask(
+            "[bold cyan]? Quality threshold (0-100)[/bold cyan]", default=args.threshold
+        )
+        console.print()
 
     config = Config(
         work_dir=args.work_dir,
         max_rounds=args.max_rounds,
         quality_threshold=args.threshold,
+        planner_timeout_sec=args.planner_timeout,
+        executor_timeout_sec=args.executor_timeout,
         verbose=args.verbose,
     )
 
@@ -135,29 +159,17 @@ async def async_main(args: argparse.Namespace) -> int:
         log_to_file=config.log_to_file,
         logs_dir=config.logs_path,
     )
-
-    print_banner()
-    console.print(
-        f"[dim]Prompt:[/dim] {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
-    )
-    console.print(f"[dim]Work dir:[/dim] {config.work_path}")
-    console.print(f"[dim]Max rounds:[/dim] {config.max_rounds}")
-    console.print("[dim]Mode:[/dim] Planner-Executor")
-    console.print(f"[dim]Threshold:[/dim] {config.quality_threshold}")
-    console.print()
-
-    orchestrator = Orchestrator(config)
-
     # Setup robust signal handling for graceful shutdown
     loop = asyncio.get_running_loop()
     main_task: asyncio.Task[Any] | None = None
     _shutting_down = False
+    _state = "prompting"
 
     def _signal_handler() -> None:
         nonlocal _shutting_down
-        if _shutting_down:
-            # Second Ctrl+C — force exit immediately
-            console.print("\n[error]Force exit![/error]")
+        if _shutting_down or _state == "prompting":
+            # Second Ctrl+C or at prompt — force exit immediately
+            console.print("\n[dim]Exiting...[/dim]")
             import os
 
             os._exit(130)
@@ -177,20 +189,37 @@ async def async_main(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, lambda s, f: _signal_handler())
         signal.signal(signal.SIGTERM, lambda s, f: _signal_handler())
 
+    # Single-shot mode
+    prompt = str(args.prompt)
+    console.print(
+        f"[dim]Prompt:[/dim] {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+    )
+    console.print(f"[dim]Work dir:[/dim] {config.work_path}")
+    console.print(f"[dim]Max rounds:[/dim] {config.max_rounds}")
+    console.print("[dim]Mode:[/dim] Planner-Executor")
+    console.print(f"[dim]Threshold:[/dim] {config.quality_threshold}")
+    console.print(
+        f"[dim]Timeouts:[/dim] Planner {config.planner_timeout_sec}s, "
+        f"Executor {config.executor_timeout_sec}s"
+    )
+    console.print()
+
+    orchestrator = Orchestrator(config)
     start = time.monotonic()
     try:
         main_task = asyncio.current_task()
         result = await orchestrator.run_pipeline(prompt)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        console.print("[warning]Interrupted — cleaning up...[/warning]")
+        console.print("\n[warning]Interrupted — cleaning up...[/warning]")
         try:
             if hasattr(orchestrator, "runner") and hasattr(
                 orchestrator.runner, "cleanup_all"
             ):
-                await asyncio.wait_for(orchestrator.runner.cleanup_all(), timeout=10)
+                cleanup_task = asyncio.create_task(orchestrator.runner.cleanup_all())
+                await asyncio.wait([cleanup_task], timeout=10)
                 console.print("[success]All tmux sessions cleaned up ✓[/success]")
-        except Exception:
-            console.print("[error]Cleanup timed out or failed[/error]")
+        except Exception as e:
+            console.print(f"[error]Cleanup timed out or failed: {e}[/error]")
         return 130
     except BaseException as e:
         logger.error("Pipeline failed: %s", e, exc_info=True)
@@ -198,17 +227,28 @@ async def async_main(args: argparse.Namespace) -> int:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(orchestrator.runner.cleanup_all(), timeout=10)
         return 1
+
     elapsed = time.monotonic() - start
-
     print_result(result, elapsed)
-
     return 0 if result.status == "success" else 1
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    exit_code = asyncio.run(async_main(args))
+
+    is_interactive = not args.prompt
+
+    if is_interactive:
+        from x_ai_cli.tui.app import XAITui
+
+        app = XAITui(args)
+        # run() will block until the TUI exits
+        app.run()
+        exit_code = 0
+    else:
+        exit_code = asyncio.run(async_main(args))
+
     sys.exit(exit_code)
 
 
