@@ -32,6 +32,9 @@ jobs:
       - name: Mypy type check
         run: mypy x_ai_cli/
 
+      - name: Run tests
+        run: pytest tests/
+
   build:
     name: Build Package
     runs-on: ubuntu-latest
