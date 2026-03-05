@@ -1,34 +1,37 @@
 """Orchestrator pipeline for x-ai CLI.
 
-Implements the full pipeline: DECOMPOSE → WORKERS → REVIEW → EXECUTE → MERGE
-with round loop, quality gate, and feedback mechanism.
+Implements the Planner-Executor pipeline:
+    PLAN → EXECUTE → REVIEW → (loop if needed)
 
-All workers are Claude CLI instances running in parallel via tmux sessions
-with optional git worktree isolation.
+Flow:
+1. Planner reads user request + repo → creates implementation plan
+2. Executor follows the plan → implements code + runs verification
+3. Planner reviews the changes → scores + provides feedback
+4. If score >= threshold → success; else loop back to step 1 with feedback
+5. If max_rounds exhausted → return best-effort result
+
+All agents are Claude CLI instances running via tmux sessions.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from x_ai_cli.agent_runner import AgentRunner
 from x_ai_cli.config import Config
 from x_ai_cli.logger import (
-    logger,
     log_phase,
     log_round,
     log_score,
+    logger,
 )
 from x_ai_cli.models import (
     AgentResult,
     AgentTask,
-    ExecutionResult,
     Feedback,
     ReviewResult,
-    SubTask,
 )
 
 
@@ -43,97 +46,36 @@ class PipelineResult:
 
 
 class Orchestrator:
-    """Main orchestrator that runs the multi-agent pipeline."""
+    """Main orchestrator that runs the Planner-Executor pipeline."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.runner = AgentRunner(config)
-        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
 
-    def _worker_names(self) -> list[str]:
-        """Generate worker names based on config.num_workers."""
-        return [f"claude_worker_{i}" for i in range(self.config.num_workers)]
-
-    def _task_dir(self, round_num: int | str, agent_name: str) -> Path:
-        """Get task directory: tasks/{run_id}/round_{n}/{agent_name}/
+    def _task_dir(self, round_num: int, agent_role: str) -> Path:
+        """Get task directory: tasks/{run_id}/round_{n}/{agent_role}/
 
         Structure:
             tasks/{run_id}/
-            ├── round_0/claude/             # DECOMPOSE phase
             ├── round_1/
-            │   ├── claude_worker_0/        # Worker 0
-            │   ├── claude_worker_1/        # Worker 1
-            │   └── claude/                 # REVIEW phase
+            │   ├── planner/     # PLAN phase
+            │   ├── executor/    # EXECUTE phase
+            │   └── reviewer/    # REVIEW phase (planner reviewing)
             ├── round_2/...
-            └── merge/claude/              # MERGE phase
         """
-        if isinstance(round_num, int):
-            round_dir = f"round_{round_num}"
-        else:
-            round_dir = str(round_num)  # e.g. "merge"
-        d = self.config.tasks_path / self.run_id / round_dir / agent_name
+        d = self.config.tasks_path / self.run_id / f"round_{round_num}" / agent_role
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     async def run_pipeline(self, user_request: str) -> PipelineResult:
-        """Run the full orchestration pipeline.
+        """Run the Planner-Executor pipeline.
 
-        Flow: DECOMPOSE → (WORKERS → REVIEW → EXECUTE)×rounds → MERGE
+        Flow: (PLAN → EXECUTE → REVIEW) × rounds
+        Stops early when score >= threshold.
         """
         self.config.ensure_dirs()
 
-        # Phase 1: Decompose
-        log_phase("DECOMPOSE", "Leader splitting task into sub-tasks")
-        sub_tasks = await self.decompose_task(user_request)
-
-        if not sub_tasks:
-            logger.error("Leader failed to decompose task")
-            return PipelineResult(status="failed", warnings=["Decomposition failed"])
-
-        logger.info("Decomposed into %d sub-task(s)", len(sub_tasks))
-
-        # Process each sub-task through the round loop
-        all_results: list[PipelineResult] = []
-        for i, sub_task in enumerate(sub_tasks):
-            logger.info(
-                "Processing sub-task %d/%d: %s",
-                i + 1,
-                len(sub_tasks),
-                sub_task.description[:80],
-            )
-            result = await self._process_sub_task(sub_task, user_request)
-            all_results.append(result)
-
-        # Phase 5: Merge (if multiple sub-tasks)
-        if len(all_results) == 1:
-            return all_results[0]
-
-        log_phase("MERGE", "Leader merging all sub-task results")
-        return await self._merge_all(user_request, sub_tasks, all_results)
-
-    async def decompose_task(self, user_request: str) -> list[SubTask]:
-        """Ask the Leader to decompose the user request into sub-tasks."""
-        task = AgentTask(
-            task_type="decompose",
-            work_dir=str(self.config.work_path),
-            instructions=user_request,
-        )
-        task_dir = self._task_dir(0, "claude")
-        task_file = task.write(task_dir)
-        result = await self.runner.run_leader(task_file)
-
-        if result.status == "error":
-            logger.error("Decompose failed: %s", result.error_message)
-            return []
-
-        return self._parse_sub_tasks(result.body)
-
-    async def _process_sub_task(
-        self,
-        sub_task: SubTask,
-        original_request: str,
-    ) -> PipelineResult:
-        """Process a single sub-task through the round loop."""
         feedback: Feedback | None = None
         best_solution: AgentResult | None = None
         best_score: float = 0.0
@@ -141,65 +83,89 @@ class Orchestrator:
         for round_num in range(1, self.config.max_rounds + 1):
             log_round(round_num, self.config.max_rounds)
 
-            # Phase 2: Workers generate code (parallel via tmux)
+            # Phase 1: PLAN — Planner reads repo and creates plan
             log_phase(
-                "WORKERS",
-                f"Generating code (round {round_num}, "
-                f"{self.config.num_workers} workers)",
+                "PLAN",
+                f"Planner analyzing codebase and creating plan (round {round_num})",
             )
-            worker_results = await self.run_workers(
-                sub_task,
-                round_num,
-                feedback,
-                original_request,
-            )
+            plan_result = await self.run_planner(user_request, round_num, feedback)
 
-            successful = {
-                k: v for k, v in worker_results.items() if v.status != "error"
-            }
-            if not successful:
-                logger.error("No workers produced a result in round %d", round_num)
+            if plan_result.status == "error":
+                logger.error(
+                    "Planner failed in round %d: %s",
+                    round_num,
+                    plan_result.error_message,
+                )
                 continue
 
-            # Phase 3: Leader reviews and scores
-            log_phase("REVIEW", f"Leader scoring {len(successful)} solution(s)")
-            review = await self.review_solutions(sub_task, successful, round_num)
+            logger.info("Planner created implementation plan")
 
-            if review.best_score > best_score:
-                best_score = review.best_score
-                best_solution = review.best_solution
+            # Phase 2: EXECUTE — Executor implements code following the plan
+            log_phase(
+                "EXECUTE",
+                f"Executor implementing code (round {round_num})",
+            )
+            exec_result = await self.run_executor(plan_result, round_num)
 
-            log_score("Best", review.best_score, self.config.quality_threshold)
+            if exec_result.status == "error":
+                logger.error(
+                    "Executor failed in round %d: %s",
+                    round_num,
+                    exec_result.error_message,
+                )
+                # Build feedback from execution failure
+                feedback = Feedback(
+                    execution_errors=[exec_result.error_message or "Executor failed"],
+                    previous_score=best_score,
+                )
+                continue
 
-            # Quality gate
-            if review.best_score >= self.config.quality_threshold:
-                # Phase 4: Leader runs tests (format, lint, unit tests)
-                log_phase("EXECUTE", "Leader running tests")
-                exec_result = await self.execute_tests(sub_task, round_num)
+            logger.info(
+                "Executor completed — %d file(s) changed",
+                len(exec_result.files_changed),
+            )
 
-                if exec_result.tests_passed:
-                    logger.info("Tests passed ✓")
-                    return PipelineResult(
-                        status="success",
-                        solution=best_solution,
-                        rounds_used=round_num,
-                    )
-                else:
-                    logger.warning("Tests failed, building feedback for retry")
-                    feedback = self._build_feedback(review, exec_result)
-                    continue
-            else:
-                # Score too low — retry with feedback
-                logger.warning(
-                    "Score %.1f below threshold %.1f, retrying",
-                    review.best_score,
+            # Phase 3: REVIEW — Planner reviews code changes
+            log_phase(
+                "REVIEW",
+                f"Planner reviewing code changes (round {round_num})",
+            )
+            review = await self.run_planner_review(
+                user_request, plan_result, exec_result, round_num
+            )
+
+            log_score("Planner", review.score, self.config.quality_threshold)
+
+            # Track best solution
+            if review.score > best_score:
+                best_score = review.score
+                best_solution = exec_result
+
+            # Quality gate — stop if score meets threshold
+            if review.score >= self.config.quality_threshold:
+                logger.info(
+                    "Score %.1f >= threshold %.1f — pipeline complete ✓",
+                    review.score,
                     self.config.quality_threshold,
                 )
-                feedback = self._build_feedback(review, exec_result=None)
+                return PipelineResult(
+                    status="success",
+                    solution=exec_result,
+                    rounds_used=round_num,
+                )
+
+            # Score too low — build feedback for next round
+            logger.warning(
+                "Score %.1f below threshold %.1f, retrying",
+                review.score,
+                self.config.quality_threshold,
+            )
+            feedback = self._build_feedback(review)
 
         # Exhausted all rounds
         logger.warning(
-            "Max rounds (%d) exhausted — returning best-effort", self.config.max_rounds
+            "Max rounds (%d) exhausted — returning best-effort",
+            self.config.max_rounds,
         )
         return PipelineResult(
             status="best_effort",
@@ -208,63 +174,72 @@ class Orchestrator:
             warnings=["Max rounds exhausted, returning best available solution"],
         )
 
-    async def run_workers(
+    # ------------------------------------------------------------------
+    # Phase implementations
+    # ------------------------------------------------------------------
+
+    async def run_planner(
         self,
-        sub_task: SubTask,
+        user_request: str,
         round_num: int,
         feedback: Feedback | None,
-        original_request: str,
-    ) -> dict[str, AgentResult]:
-        """Dispatch sub-task to N Claude workers in parallel via tmux."""
-        worker_names = self._worker_names()
-        task_files: dict[str, Path] = {}
-
-        instructions = (
-            f"Original request: {original_request}\n\nSub-task: {sub_task.description}"
+    ) -> AgentResult:
+        """Phase 1: Ask the Planner to analyze repo and create a plan."""
+        task = AgentTask(
+            task_type="plan",
+            work_dir=str(self.config.work_path),
+            round=round_num,
+            instructions=user_request,
+            feedback=feedback,
         )
-        if sub_task.constraints:
-            instructions += "\n\nConstraints:\n" + "\n".join(
-                f"- {c}" for c in sub_task.constraints
-            )
+        task_dir = self._task_dir(round_num, "planner")
+        task_file = task.write(task_dir)
+        return await self.runner.run_agent(task_file, role="planner")
 
-        for worker_name in worker_names:
-            task = AgentTask(
-                task_type="generate",
-                work_dir=str(self.config.work_path),
-                round=round_num,
-                instructions=instructions,
-                feedback=feedback,
-            )
-            task_dir = self._task_dir(round_num, worker_name)
-            task_file = task.write(task_dir)
-            task_files[worker_name] = task_file
-
-        return await self.runner.run_workers_parallel(task_files, self.run_id)
-
-    async def review_solutions(
+    async def run_executor(
         self,
-        sub_task: SubTask,
-        worker_results: dict[str, AgentResult],
+        plan_result: AgentResult,
+        round_num: int,
+    ) -> AgentResult:
+        """Phase 2: Ask the Executor to implement code following the plan."""
+        task = AgentTask(
+            task_type="execute",
+            work_dir=str(self.config.work_path),
+            round=round_num,
+            instructions="Follow the implementation plan below.",
+            plan_content=plan_result.body,
+        )
+        task_dir = self._task_dir(round_num, "executor")
+        task_file = task.write(task_dir)
+        return await self.runner.run_agent(task_file, role="executor")
+
+    async def run_planner_review(
+        self,
+        user_request: str,
+        plan_result: AgentResult,
+        exec_result: AgentResult,
         round_num: int,
     ) -> ReviewResult:
-        """Ask the Leader to review and score all worker solutions."""
-        # Build review prompt with all solutions
-        solutions_text = ""
-        for worker_name, result in worker_results.items():
-            solutions_text += (
-                f"### {worker_name} Solution\n\n"
-                f"**Status**: {result.status}\n"
-                f"**Files changed**: {', '.join(result.files_changed) if result.files_changed else 'N/A'}\n\n"
-                f"{result.body}\n\n---\n\n"
-            )
-
+        """Phase 3: Ask the Planner to review the Executor's changes."""
+        # Build review instructions with all context
         instructions = (
-            f"Review and score the following worker solutions for sub-task: "
-            f"{sub_task.description}\n\n"
-            f"{solutions_text}\n"
-            f"Score each solution (0-100) on: correctness, code_quality, "
-            f"security, performance, maintainability.\n"
-            f"Provide weighted average and recommendation."
+            f"## Original Request\n\n{user_request}\n\n"
+            f"## Implementation Plan (what was expected)\n\n{plan_result.body}\n\n"
+            f"## Executor Report\n\n"
+            f"**Status**: {exec_result.status}\n"
+            f"**Files changed**: "
+            f"{', '.join(exec_result.files_changed)}"
+            f"{'' if exec_result.files_changed else 'N/A'}"
+            f"\n\n"
+            f"{exec_result.body}\n\n"
+            f"---\n\n"
+            f"Review the Executor's implementation against "
+            f"the plan and the original request.\n"
+            f"Read each changed file in "
+            f"`{self.config.work_path}` and score the solution.\n"
+            f"Score on: correctness (0.25), code_quality (0.20), security (0.20), "
+            f"performance (0.15), maintainability (0.20).\n"
+            f"Provide the weighted average as `score` in frontmatter."
         )
 
         task = AgentTask(
@@ -273,237 +248,51 @@ class Orchestrator:
             round=round_num,
             instructions=instructions,
         )
-        task_dir = self._task_dir(round_num, "claude")
+        task_dir = self._task_dir(round_num, "reviewer")
         task_file = task.write(task_dir)
-        result = await self.runner.run_leader(task_file)
+        result = await self.runner.run_agent(task_file, role="planner")
 
-        review = ReviewResult()
+        review = ReviewResult(solution=exec_result)
 
         if result.status != "error" and result.score is not None:
-            review.best_score = result.score
-            review.merge_plan = result.body
-
-            # Try to identify best worker from the body
-            best_worker = self._extract_best_worker(result.body, worker_results)
-            if best_worker:
-                review.best_worker = best_worker
-                review.best_solution = worker_results.get(best_worker)
+            review.score = result.score
+            review.review_notes = result.body
         else:
-            # Fallback: pick first successful worker
-            for worker_name, wr in worker_results.items():
-                if wr.status != "error":
-                    review.best_worker = worker_name
-                    review.best_solution = wr
-                    review.best_score = 50.0  # default low score
-                    break
+            # Fallback: assign a low score if review failed
+            review.score = 30.0
+            review.review_notes = result.body or "Review failed"
+            logger.warning("Review parsing failed, assigned fallback score 30.0")
 
         return review
-
-    async def execute_tests(
-        self,
-        sub_task: SubTask,
-        round_num: int,
-    ) -> ExecutionResult:
-        """Ask the Leader to run formatter, linter, and unit tests."""
-        instructions = (
-            f"Run quality checks on the code in `{self.config.work_path}` "
-            f"for sub-task: {sub_task.description}\n\n"
-            f"You MUST execute the following steps in order:\n\n"
-            f"1. **Detect project type** — look at the files in work_dir to determine "
-            f"the language/framework (Python, Node.js, Go, Rust, etc.)\n\n"
-            f"2. **Format** — run the appropriate formatter:\n"
-            f"   - Python: `ruff format .` or `black .`\n"
-            f"   - Node.js: `npx prettier --write .`\n"
-            f"   - Go: `gofmt -w .`\n"
-            f"   - Rust: `cargo fmt`\n\n"
-            f"3. **Lint** — run the appropriate linter:\n"
-            f"   - Python: `ruff check . --fix` or `flake8`\n"
-            f"   - Node.js: `npx eslint . --fix`\n"
-            f"   - Go: `golangci-lint run`\n"
-            f"   - Rust: `cargo clippy`\n\n"
-            f"4. **Unit tests** — run the test suite if one exists:\n"
-            f"   - Python: `pytest` or `python -m unittest`\n"
-            f"   - Node.js: `npm test`\n"
-            f"   - Go: `go test ./...`\n"
-            f"   - Rust: `cargo test`\n\n"
-            f"In your result frontmatter:\n"
-            f"- Set `status: success` if ALL checks pass\n"
-            f"- Set `status: error` if ANY check fails\n"
-            f"- Include the full output of each step in the body\n"
-            f"- List any errors clearly so workers can fix them"
-        )
-
-        task = AgentTask(
-            task_type="execute",
-            work_dir=str(self.config.work_path),
-            round=round_num,
-            instructions=instructions,
-        )
-        task_dir = self._task_dir(round_num, "claude")
-        task_file = task.write(task_dir)
-        result = await self.runner.run_leader(task_file)
-
-        # Map AgentResult → ExecutionResult
-        tests_passed = result.status == "success"
-        return ExecutionResult(
-            exit_code=0 if tests_passed else 1,
-            stdout=result.body,
-            stderr=result.error_message or "",
-            tests_passed=tests_passed,
-        )
-
-    async def _merge_all(
-        self,
-        original_request: str,
-        sub_tasks: list[SubTask],
-        results: list[PipelineResult],
-    ) -> PipelineResult:
-        """Ask Leader to merge all sub-task results into final solution."""
-        merge_text = ""
-        for sub_task, result in zip(sub_tasks, results):
-            merge_text += (
-                f"### Sub-task: {sub_task.description}\n**Status**: {result.status}\n\n"
-            )
-            if result.solution:
-                merge_text += f"{result.solution.body}\n\n---\n\n"
-
-        task = AgentTask(
-            task_type="merge",
-            work_dir=str(self.config.work_path),
-            instructions=(
-                f"Original request: {original_request}\n\n"
-                f"Merge the following sub-task solutions into a cohesive final solution:\n\n"
-                f"{merge_text}"
-            ),
-        )
-        task_dir = self._task_dir("merge", "claude")
-        task_file = task.write(task_dir)
-        result = await self.runner.run_leader(task_file)
-
-        total_rounds = max(r.rounds_used for r in results) if results else 0
-        all_warnings = [w for r in results for w in r.warnings]
-
-        return PipelineResult(
-            status="success" if result.status != "error" else "failed",
-            solution=result,
-            rounds_used=total_rounds,
-            warnings=all_warnings,
-        )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _parse_sub_tasks(self, body: str) -> list[SubTask]:
-        """Parse sub-tasks from Leader's decompose result body.
-
-        Captures the full text block per numbered item, including all
-        indented lines (constraints, language, files, etc.).
-
-        Expects format like:
-        1. **Task description**
-           - Language: python
-           - Constraints:
-             - Must validate input
-        """
-        sub_tasks: list[SubTask] = []
-        lines = body.split("\n")
-
-        current_block: list[str] = []
-        in_task = False
-
-        for line in lines:
-            # Detect a new numbered item (e.g. '1. ', '2. ', '10. ')
-            if re.match(r"^\s*\d+\.\s+", line):
-                # Save previous block
-                if current_block:
-                    full_text = "\n".join(current_block).strip()
-                    if full_text:
-                        sub_tasks.append(SubTask(description=full_text))
-                current_block = [line]
-                in_task = True
-            elif in_task:
-                # Continuation lines (indented or empty lines within the block)
-                if line.strip() == "":
-                    # Empty line might end the block or be spacing within it
-                    current_block.append(line)
-                elif (
-                    line.startswith(" ")
-                    or line.startswith("\t")
-                    or line.startswith("-")
-                ):
-                    current_block.append(line)
-                else:
-                    # Non-indented, non-numbered line → end of block
-                    current_block.append(line)
-
-        # Don't forget the last block
-        if current_block:
-            full_text = "\n".join(current_block).strip()
-            if full_text:
-                sub_tasks.append(SubTask(description=full_text))
-
-        # Fallback: if no numbered list found, treat entire body as one task
-        if not sub_tasks and body.strip():
-            sub_tasks.append(SubTask(description=body.strip()[:2000]))
-
-        return sub_tasks
-
-    def _extract_best_worker(
-        self,
-        review_body: str,
-        worker_results: dict[str, AgentResult],
-    ) -> str | None:
-        """Try to identify which worker was picked as best from review text."""
-        review_lower = review_body.lower()
-        for worker_name in worker_results:
-            if worker_name.lower() in review_lower:
-                # Simple heuristic: check if this worker is mentioned near "best" or "recommend"
-                idx = review_lower.find(worker_name.lower())
-                context = review_lower[max(0, idx - 50) : idx + 50]
-                if any(
-                    word in context
-                    for word in ["best", "recommend", "base", "winner", "pick"]
-                ):
-                    return worker_name
-        # Fallback: first worker
-        return next(iter(worker_results), None)
-
-    def _build_feedback(
-        self,
-        review: ReviewResult,
-        exec_result: ExecutionResult | None,
-    ) -> Feedback:
+    def _build_feedback(self, review: ReviewResult) -> Feedback:
         """Build structured feedback for the next round."""
-        feedback = Feedback(
-            previous_best_approach=f"{review.best_worker} (score: {review.best_score})",
-        )
+        feedback = Feedback(previous_score=review.score)
 
-        # Extract issues from review
-        if review.merge_plan:
-            # Look for "Issues" or "Fix" sections in the review body
-            lines = review.merge_plan.split("\n")
+        # Extract issues from review notes
+        if review.review_notes:
+            lines = review.review_notes.split("\n")
             for line in lines:
                 line_stripped = line.strip().lstrip("- ").lstrip("* ")
-                if any(
-                    kw in line.lower()
-                    for kw in ["fix", "issue", "bug", "missing", "add"]
+                if (
+                    any(
+                        kw in line.lower()
+                        for kw in ["fix", "issue", "bug", "missing", "add", "error"]
+                    )
+                    and line_stripped
+                    and len(line_stripped) > 10
                 ):
-                    if line_stripped and len(line_stripped) > 10:
-                        feedback.mandatory_fixes.append(line_stripped)
-
-        # Add execution errors
-        if exec_result and not exec_result.tests_passed:
-            if exec_result.stderr:
-                feedback.execution_errors.append(exec_result.stderr[:500])
-            if exec_result.stdout:
-                feedback.execution_errors.append(f"stdout: {exec_result.stdout[:300]}")
+                    feedback.mandatory_fixes.append(line_stripped)
 
         # Score gaps
-        if review.best_score < self.config.quality_threshold:
-            gap = self.config.quality_threshold - review.best_score
+        if review.score < self.config.quality_threshold:
+            gap = self.config.quality_threshold - review.score
             feedback.score_gaps["overall"] = (
-                f"{review.best_score:.0f} → target {self.config.quality_threshold:.0f} "
+                f"{review.score:.0f} → target {self.config.quality_threshold:.0f} "
                 f"(gap: {gap:.0f})"
             )
 

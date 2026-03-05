@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "x-ai-cli"
+version = "0.1.0"
+description = "Multi-Agent AI Coding System — Planner-Executor orchestrator for Claude CLI"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Manh Pham", email = "h3x4r@yahoo.com" },
+]
+keywords = ["ai", "multi-agent", "coding", "claude", "orchestrator"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "PyYAML>=6.0",
+    "rich>=13.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/manhpham90vn/x-ai"
+Repository = "https://github.com/manhpham90vn/x-ai"
+Issues = "https://github.com/manhpham90vn/x-ai/issues"
+
+[project.scripts]
+x-ai = "x_ai_cli.main:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"

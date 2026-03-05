@@ -2,3 +2,8 @@ venv
 logs
 tasks
 __pycache__
+.ruff_cache
+.claude
+dist/
+build/
+*.egg-info/

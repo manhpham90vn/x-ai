@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import signal
 import sys
 import time
@@ -20,7 +21,7 @@ from x_ai_cli.orchestrator import Orchestrator
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="x-ai",
-        description="Multi-Agent AI Coding System — Orchestrator CLI",
+        description="Multi-Agent AI Coding System — Planner-Executor CLI",
     )
     parser.add_argument(
         "prompt",
@@ -46,13 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=70.0,
         help="Quality threshold score 0-100 (default: 70.0)",
-    )
-    parser.add_argument(
-        "--workers",
-        "-w",
-        type=int,
-        default=2,
-        help="Number of parallel Claude workers (default: 2)",
     )
     parser.add_argument(
         "--verbose",
@@ -81,7 +75,7 @@ def get_prompt(args: argparse.Namespace) -> str:
 def print_banner() -> None:
     console.print(
         Panel(
-            "[bold cyan]x-ai[/bold cyan] — Multi-Agent AI Coding System\n"
+            "[bold cyan]x-ai[/bold cyan] — Planner-Executor AI Coding System\n"
             f"[dim]v{__version__}[/dim]",
             border_style="cyan",
             padding=(1, 2),
@@ -132,7 +126,6 @@ async def async_main(args: argparse.Namespace) -> int:
         work_dir=args.work_dir,
         max_rounds=args.max_rounds,
         quality_threshold=args.threshold,
-        num_workers=args.workers,
         verbose=args.verbose,
     )
 
@@ -148,7 +141,7 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     console.print(f"[dim]Work dir:[/dim] {config.work_path}")
     console.print(f"[dim]Max rounds:[/dim] {config.max_rounds}")
-    console.print(f"[dim]Workers:[/dim] {config.num_workers} (tmux + worktree)")
+    console.print("[dim]Mode:[/dim] Planner-Executor")
     console.print(f"[dim]Threshold:[/dim] {config.quality_threshold}")
     console.print()
 
@@ -179,8 +172,7 @@ async def async_main(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, _signal_handler)
         loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     except NotImplementedError:
-        # Signal handlers not supported on this platform (e.g., Windows without pywin32)
-        # Fall back to setting up the signal module directly
+        # Signal handlers not supported on this platform
         signal.signal(signal.SIGINT, lambda s, f: _signal_handler())
         signal.signal(signal.SIGTERM, lambda s, f: _signal_handler())
 
@@ -191,7 +183,6 @@ async def async_main(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         console.print("[warning]Interrupted — cleaning up...[/warning]")
         try:
-            # Cancel the orchestrator's running tasks if possible
             if hasattr(orchestrator, "runner") and hasattr(
                 orchestrator.runner, "cleanup_all"
             ):
@@ -203,10 +194,8 @@ async def async_main(args: argparse.Namespace) -> int:
     except BaseException as e:
         logger.error("Pipeline failed: %s", e, exc_info=True)
         console.print(f"\n[error]Pipeline failed: {e}[/error]")
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(orchestrator.runner.cleanup_all(), timeout=10)
-        except Exception:
-            pass
         return 1
     elapsed = time.monotonic() - start
 

@@ -18,13 +18,14 @@ Tmux is ONLY used for:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import shutil
 import time
 from pathlib import Path
 
 from x_ai_cli.config import Config
-from x_ai_cli.logger import logger, log_agent_start, log_agent_done
+from x_ai_cli.logger import log_agent_done, log_agent_start, logger
 from x_ai_cli.models import AgentResult
 
 
@@ -134,10 +135,8 @@ class AgentRunner:
             "Cleaning up %d active tmux session(s)...", len(self._active_sessions)
         )
         for session_name in list(self._active_sessions):
-            try:
+            with contextlib.suppress(Exception):
                 await self.tmux.kill(session_name)
-            except Exception:
-                pass
         self._active_sessions.clear()
         logger.info("All tmux sessions cleaned up")
 
@@ -168,7 +167,8 @@ class AgentRunner:
             f"# YOUR TASK\n\n"
             f"1. Read the task file at: `{task_file}`\n"
             f"2. Follow the instructions in the task file\n"
-            f"3. Write your result (Markdown with YAML frontmatter) to: `{result_file}`\n\n"
+            f"3. Write your result (Markdown with YAML frontmatter) "
+            f"to: `{result_file}`\n\n"
             f"IMPORTANT:\n"
             f"- The result file MUST contain YAML frontmatter (---\\nkey: value\\n---) "
             f"followed by your response body.\n"
@@ -179,9 +179,9 @@ class AgentRunner:
 
     def _get_timeout(self, role: str) -> int:
         """Get timeout seconds based on agent role."""
-        if role == "leader":
-            return self.config.leader_timeout_sec
-        return self.config.worker_timeout_sec
+        if role == "planner":
+            return self.config.planner_timeout_sec
+        return self.config.executor_timeout_sec
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -190,7 +190,6 @@ class AgentRunner:
     async def _create_claude_session(
         self,
         session_name: str,
-        worktree_name: str | None = None,
     ) -> bool:
         """Create a tmux session and launch Claude interactive mode inside it.
 
@@ -205,8 +204,6 @@ class AgentRunner:
         self._active_sessions.add(session_name)
 
         cmd_parts = [self.config.claude_bin, "--dangerously-skip-permissions"]
-        if worktree_name and self.config.use_worktree:
-            cmd_parts.extend(["--worktree", worktree_name])
 
         launch_cmd = (
             f"cd {shlex.quote(str(self.config.work_path))} && {' '.join(cmd_parts)}"
@@ -483,11 +480,15 @@ class AgentRunner:
         return False
 
     # ------------------------------------------------------------------
-    # Leader
+    # Generic agent runner
     # ------------------------------------------------------------------
 
-    async def run_leader(self, task_file: Path) -> AgentResult:
-        """Run Claude as Leader in native interactive tmux session.
+    async def run_agent(
+        self,
+        task_file: Path,
+        role: str = "planner",
+    ) -> AgentResult:
+        """Run Claude as a Planner or Executor agent in tmux session.
 
         File-based flow:
         1. Create tmux session → handle startup prompts
@@ -503,11 +504,11 @@ class AgentRunner:
                 return AgentResult.error(f"{label} binary not found: {binary}")
 
         task_id = task_file.stem.replace(".task", "")
-        timeout = self._get_timeout("leader")
+        timeout = self._get_timeout(role)
         result_file = task_file.parent / f"{task_id}.result.md"
-        session_name = f"xai_leader_{task_id[:8]}"
+        session_name = f"xai_{role}_{task_id[:8]}"
 
-        log_agent_start("claude:leader", task_id)
+        log_agent_start(f"claude:{role}", task_id)
 
         try:
             # 1. Create session with Claude
@@ -518,27 +519,27 @@ class AgentRunner:
             # 2. Handle startup prompts
             ready = await self._handle_startup_prompts(session_name)
             if not ready:
-                log_agent_done("claude:leader", task_id, "error")
+                log_agent_done(f"claude:{role}", task_id, "error")
                 return AgentResult.error(f"Claude failed to start in {session_name}")
 
             # 3. Inject prompt (file-based)
-            prompt = self._build_prompt(task_file, result_file, "leader")
+            prompt = self._build_prompt(task_file, result_file, role)
             await self._inject_prompt(session_name, prompt)
 
             # 4. Wait for result file on disk
             found = await self._wait_for_result_file(session_name, result_file, timeout)
 
             if not found:
-                log_agent_done("claude:leader", task_id, "timeout")
+                log_agent_done(f"claude:{role}", task_id, "timeout")
                 return AgentResult.error(
-                    f"claude:leader timed out after {timeout}s — "
+                    f"claude:{role} timed out after {timeout}s — "
                     f"result file not written: {result_file}"
                 )
 
         except Exception as e:
-            logger.error("claude:leader error: %s", e, exc_info=True)
-            log_agent_done("claude:leader", task_id, "error")
-            return AgentResult.error(f"claude:leader error: {e}")
+            logger.error("claude:%s error: %s", role, e, exc_info=True)
+            log_agent_done(f"claude:{role}", task_id, "error")
+            return AgentResult.error(f"claude:{role} error: {e}")
 
         finally:
             await self.tmux.kill(session_name)
@@ -546,95 +547,5 @@ class AgentRunner:
 
         # 5. Parse result file
         result = AgentResult.from_file(result_file)
-        log_agent_done("claude:leader", task_id, result.status)
+        log_agent_done(f"claude:{role}", task_id, result.status)
         return result
-
-    # ------------------------------------------------------------------
-    # Workers
-    # ------------------------------------------------------------------
-
-    async def run_worker(
-        self,
-        worker_name: str,
-        task_file: Path,
-        run_id: str,
-    ) -> AgentResult:
-        """Run a Claude worker in native interactive tmux session.
-
-        File-based flow — same as run_leader.
-        """
-        for binary, label in [
-            (self.config.claude_bin, "claude"),
-            (self.config.tmux_bin, "tmux"),
-        ]:
-            if not shutil.which(binary):
-                return AgentResult.error(f"{label} binary not found: {binary}")
-
-        task_id = task_file.stem.replace(".task", "")
-        timeout = self._get_timeout("worker")
-        result_file = task_file.parent / f"{task_id}.result.md"
-        session_name = f"xai_{run_id}_{worker_name}"
-        worktree_name = f"xai_{worker_name}" if self.config.use_worktree else None
-
-        log_agent_start(worker_name, task_id)
-
-        try:
-            created = await self._create_claude_session(session_name, worktree_name)
-            if not created:
-                return AgentResult.error(f"Failed to create session: {session_name}")
-
-            ready = await self._handle_startup_prompts(session_name)
-            if not ready:
-                log_agent_done(worker_name, task_id, "error")
-                return AgentResult.error(f"Claude failed to start in {session_name}")
-
-            prompt = self._build_prompt(task_file, result_file, "worker")
-            await self._inject_prompt(session_name, prompt)
-
-            found = await self._wait_for_result_file(session_name, result_file, timeout)
-
-            if not found:
-                log_agent_done(worker_name, task_id, "timeout")
-                return AgentResult.error(
-                    f"{worker_name} timed out after {timeout}s — "
-                    f"result file not written: {result_file}"
-                )
-
-        except Exception as e:
-            logger.error("%s error: %s", worker_name, e, exc_info=True)
-            log_agent_done(worker_name, task_id, "error")
-            return AgentResult.error(f"{worker_name} error: {e}")
-
-        finally:
-            await self.tmux.kill(session_name)
-            self._active_sessions.discard(session_name)
-
-        result = AgentResult.from_file(result_file)
-        log_agent_done(worker_name, task_id, result.status)
-        return result
-
-    async def run_workers_parallel(
-        self,
-        task_files: dict[str, Path],
-        run_id: str,
-    ) -> dict[str, AgentResult]:
-        """Run multiple Claude workers in parallel via tmux sessions."""
-        tasks = {
-            worker_name: self.run_worker(worker_name, task_file, run_id)
-            for worker_name, task_file in task_files.items()
-        }
-
-        results: dict[str, AgentResult] = {}
-        gathered = await asyncio.gather(
-            *tasks.values(),
-            return_exceptions=True,
-        )
-
-        for worker_name, result in zip(tasks.keys(), gathered):
-            if isinstance(result, Exception):
-                logger.error("%s failed: %s", worker_name, result)
-                results[worker_name] = AgentResult.error(str(result))
-            else:
-                results[worker_name] = result
-
-        return results

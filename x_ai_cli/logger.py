@@ -6,7 +6,7 @@ Provides rich console output and optional file logging.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -65,7 +65,7 @@ def setup_logging(
 
     # File handler
     if log_to_file and logs_dir:
-        run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        run_id = run_id or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         run_log_dir = logs_dir / run_id
         run_log_dir.mkdir(parents=True, exist_ok=True)
 
