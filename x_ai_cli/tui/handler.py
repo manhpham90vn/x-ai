@@ -4,7 +4,6 @@ Bridges standard python logging to a Textual RichLog widget.
 """
 
 import logging
-import threading
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -30,11 +29,13 @@ class TextualLogHandler(logging.Handler):
         try:
             msg = self.format(record)
             app = self.rich_log.app
-            # If we're in the same thread (async worker), write directly
-            app_thread = getattr(app, "_thread", None)
-            if threading.current_thread() is app_thread:
+
+            try:
+                # Direct write works if we're in the app thread (e.g., @work workers)
                 self.rich_log.write(msg)
-            else:
+            except RuntimeError:
+                # Required if we're truly in a different thread
                 app.call_from_thread(self.rich_log.write, msg)
-        except Exception:
-            pass  # Silently ignore errors during shutdown
+        except Exception as exc:
+            with open("/tmp/tui_handler_errors.log", "a") as f:  # noqa: PTH123
+                f.write(f"emit error: {exc!r} | msg={record.getMessage()!r}\n")

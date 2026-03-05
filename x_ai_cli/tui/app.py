@@ -6,7 +6,7 @@ from typing import Any
 
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
@@ -18,7 +18,7 @@ from x_ai_cli.tui.handler import TextualLogHandler
 from x_ai_cli.tui.widgets import ActionLog
 
 
-class ConfigScreen(ModalScreen[tuple[str, int, float]]):
+class ConfigScreen(ModalScreen[tuple[str, int, float, int, int]]):
     """Screen for configuring x-ai parameters."""
 
     CSS = """
@@ -29,10 +29,10 @@ class ConfigScreen(ModalScreen[tuple[str, int, float]]):
     #dialog {
         grid-size: 2;
         grid-gutter: 1 2;
-        grid-rows: 1fr 1fr 1fr 1fr;
+        grid-rows: 1fr 1fr 1fr 1fr 1fr 1fr;
         padding: 1 2;
         width: 60;
-        height: 20;
+        height: 28;
         border: thick cyan;
         background: $surface;
     }
@@ -75,6 +75,20 @@ class ConfigScreen(ModalScreen[tuple[str, int, float]]):
                 type="number",
             )
 
+            yield Label("Planner Timeout (s):")
+            yield Input(
+                value=str(self.current_config.planner_timeout_sec),
+                id="planner-timeout",
+                type="integer",
+            )
+
+            yield Label("Executor Timeout (s):")
+            yield Input(
+                value=str(self.current_config.executor_timeout_sec),
+                id="executor-timeout",
+                type="integer",
+            )
+
             with Horizontal(id="buttons"):
                 yield Button("Save", id="save", variant="success")
                 yield Button("Cancel", id="cancel", variant="error")
@@ -84,7 +98,13 @@ class ConfigScreen(ModalScreen[tuple[str, int, float]]):
         work_dir = self.query_one("#work-dir", Input).value
         max_rounds = int(self.query_one("#max-rounds", Input).value or "3")
         threshold = float(self.query_one("#threshold", Input).value or "70.0")
-        self.dismiss((work_dir, max_rounds, threshold))
+        planner_timeout = int(self.query_one("#planner-timeout", Input).value or "600")
+        executor_timeout = int(
+            self.query_one("#executor-timeout", Input).value or "600"
+        )
+        self.dismiss(
+            (work_dir, max_rounds, threshold, planner_timeout, executor_timeout)
+        )
 
     @on(Button.Pressed, "#cancel")
     def cancel(self) -> None:
@@ -186,23 +206,6 @@ class TmuxViewerScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
-class Sidebar(Vertical):
-    """Sidebar for config and status."""
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll():
-            yield Static("x-ai Status", id="title", classes="sidebar-title")
-            yield RichLog(
-                id="status-panel",
-                highlight=False,
-                auto_scroll=True,
-                markup=True,
-                wrap=True,
-            )
-            yield Static("\nConfig", classes="sidebar-title")
-            yield Static(id="config-panel")
-
-
 class XAITui(App[None]):
     """Textual TUI for x-ai orchestrator."""
 
@@ -221,24 +224,10 @@ class XAITui(App[None]):
     }
 
     ActionLog {
-        width: 3fr;
+        width: 1fr;
         height: 1fr;
         border: solid green;
     }
-
-    Sidebar {
-        width: 1fr;
-        height: 1fr;
-        border: solid cyan;
-        padding: 1;
-    }
-
-    .sidebar-title {
-        text-style: bold;
-        color: cyan;
-    }
-
-
     """
 
     BINDINGS = [
@@ -264,29 +253,28 @@ class XAITui(App[None]):
         yield Header(show_clock=True)
         with Horizontal(id="main-content"):
             yield ActionLog()
-            yield Sidebar()
 
         yield Input(placeholder="Ask x-ai a coding task...", id="task-input")
         yield Footer()
 
-    def _update_config_panel(self) -> None:
-        config_panel = self.query_one("#config-panel", Static)
-        config_panel.update(
-            f"Work Dir: {self.config.work_path}\n"
-            f"Max Rounds: {self.config.max_rounds}\n"
-            f"Threshold: {self.config.quality_threshold}"
-        )
-
     def on_mount(self) -> None:
         self.title = "x-ai Planner-Executor"
-
-        # Setup config panel info
-        self._update_config_panel()
 
         # Setup custom logging handler to route to UI
         self._setup_tui_logging()
 
         log = self.query_one("#action-log", RichLog)
+
+        # Display config inline on startup
+        log.write("[bold cyan]━━━ Current Configuration ━━━[/bold cyan]")
+        log.write(f"Work Dir: [green]{self.config.work_path}[/green]")
+        log.write(f"Max Rounds: [green]{self.config.max_rounds}[/green]")
+        log.write(f"Threshold: [green]{self.config.quality_threshold}[/green]")
+        log.write(
+            f"Timeouts: [green]Planner {self.config.planner_timeout_sec}s[/green], "
+            f"[green]Executor {self.config.executor_timeout_sec}s[/green]\n"
+        )
+
         log.write("[bold green]Welcome to x-ai![/bold green]")
         log.write("Type your coding task below and press Enter.")
         log.write(
@@ -296,26 +284,31 @@ class XAITui(App[None]):
             "  [bold]Ctrl+Q[/bold] Quit[/dim]"
         )
 
+        # Focus the input automatically
+        self.query_one("#task-input", Input).focus()
+
     def action_configure(self) -> None:
         """Action handler for 'c' binding."""
 
-        def check_response(result: tuple[str, int, float] | None) -> None:
+        def check_response(result: tuple[str, int, float, int, int] | None) -> None:
             if result is not None:
-                work_dir, max_rounds, threshold = result
+                work_dir, max_rounds, threshold, p_timeout, e_timeout = result
 
                 # Re-initialize config to recalculate derived paths (work_path etc)
                 self.config = Config(
                     work_dir=work_dir,
                     max_rounds=max_rounds,
                     quality_threshold=threshold,
+                    planner_timeout_sec=p_timeout,
+                    executor_timeout_sec=e_timeout,
                     verbose=self.config.verbose,
                 )
-                self._update_config_panel()
 
                 log = self.query_one("#action-log", RichLog)
                 log.write(
                     f"\n[green]Config updated: {work_dir}, {max_rounds} rounds, "
-                    f"{threshold} threshold[/green]"
+                    f"{threshold} threshold, timeouts: "
+                    f"Planner {p_timeout}s, Executor {e_timeout}s[/green]"
                 )
 
         self.push_screen(ConfigScreen(self.config), check_response)
@@ -355,29 +348,16 @@ class XAITui(App[None]):
         rich_log = self.query_one("#action-log", RichLog)
         tui_handler = TextualLogHandler(rich_log)
 
-        # Recreate a console formatting specifically targeting the RichLog via
-        # a string format wrapper.
-        # TextualLogHandler handles passing string containing Markup tags
+        # We format for the ActionLog to show full logs now
         tui_handler.setLevel(logging.DEBUG if self.config.verbose else logging.INFO)
-        tui_handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(tui_handler)
-
-        # Also route logs to the status panel in the sidebar
-        status_log = self.query_one("#status-panel", RichLog)
-        status_handler = TextualLogHandler(status_log)
-        status_handler.setLevel(logging.INFO)
-        status_handler.setFormatter(
+        tui_handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
         )
-        logger.addHandler(status_handler)
+        logger.addHandler(tui_handler)
 
     @work(exclusive=True)
     async def run_pipeline(self, prompt: str) -> None:
         """Run the orchestrator pipeline asynchronously in background."""
-        # Clear status panel for a fresh run
-        with contextlib.suppress(Exception):
-            self.query_one("#status-panel", RichLog).clear()
-
         self.orchestrator = Orchestrator(self.config)
         orchestrator = self.orchestrator
 
