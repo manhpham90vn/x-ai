@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import signal
 import sys
 import time
@@ -193,10 +194,8 @@ async def async_main(args: argparse.Namespace) -> int:
     except BaseException as e:
         logger.error("Pipeline failed: %s", e, exc_info=True)
         console.print(f"\n[error]Pipeline failed: {e}[/error]")
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(orchestrator.runner.cleanup_all(), timeout=10)
-        except Exception:
-            pass
         return 1
     elapsed = time.monotonic() - start
 

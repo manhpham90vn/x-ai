@@ -18,6 +18,7 @@ Tmux is ONLY used for:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import shutil
 import time
@@ -134,10 +135,8 @@ class AgentRunner:
             "Cleaning up %d active tmux session(s)...", len(self._active_sessions)
         )
         for session_name in list(self._active_sessions):
-            try:
+            with contextlib.suppress(Exception):
                 await self.tmux.kill(session_name)
-            except Exception:
-                pass
         self._active_sessions.clear()
         logger.info("All tmux sessions cleaned up")
 
@@ -168,7 +167,8 @@ class AgentRunner:
             f"# YOUR TASK\n\n"
             f"1. Read the task file at: `{task_file}`\n"
             f"2. Follow the instructions in the task file\n"
-            f"3. Write your result (Markdown with YAML frontmatter) to: `{result_file}`\n\n"
+            f"3. Write your result (Markdown with YAML frontmatter) "
+            f"to: `{result_file}`\n\n"
             f"IMPORTANT:\n"
             f"- The result file MUST contain YAML frontmatter (---\\nkey: value\\n---) "
             f"followed by your response body.\n"

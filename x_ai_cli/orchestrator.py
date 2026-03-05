@@ -16,7 +16,7 @@ All agents are Claude CLI instances running via tmux sessions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from x_ai_cli.agent_runner import AgentRunner
@@ -51,7 +51,7 @@ class Orchestrator:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.runner = AgentRunner(config)
-        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
 
     def _task_dir(self, round_num: int, agent_role: str) -> Path:
         """Get task directory: tasks/{run_id}/round_{n}/{agent_role}/
@@ -227,11 +227,16 @@ class Orchestrator:
             f"## Implementation Plan (what was expected)\n\n{plan_result.body}\n\n"
             f"## Executor Report\n\n"
             f"**Status**: {exec_result.status}\n"
-            f"**Files changed**: {', '.join(exec_result.files_changed) if exec_result.files_changed else 'N/A'}\n\n"
+            f"**Files changed**: "
+            f"{', '.join(exec_result.files_changed)}"
+            f"{'' if exec_result.files_changed else 'N/A'}"
+            f"\n\n"
             f"{exec_result.body}\n\n"
             f"---\n\n"
-            f"Review the Executor's implementation against the plan and the original request.\n"
-            f"Read each changed file in `{self.config.work_path}` and score the solution.\n"
+            f"Review the Executor's implementation against "
+            f"the plan and the original request.\n"
+            f"Read each changed file in "
+            f"`{self.config.work_path}` and score the solution.\n"
             f"Score on: correctness (0.25), code_quality (0.20), security (0.20), "
             f"performance (0.15), maintainability (0.20).\n"
             f"Provide the weighted average as `score` in frontmatter."
@@ -273,12 +278,15 @@ class Orchestrator:
             lines = review.review_notes.split("\n")
             for line in lines:
                 line_stripped = line.strip().lstrip("- ").lstrip("* ")
-                if any(
-                    kw in line.lower()
-                    for kw in ["fix", "issue", "bug", "missing", "add", "error"]
+                if (
+                    any(
+                        kw in line.lower()
+                        for kw in ["fix", "issue", "bug", "missing", "add", "error"]
+                    )
+                    and line_stripped
+                    and len(line_stripped) > 10
                 ):
-                    if line_stripped and len(line_stripped) > 10:
-                        feedback.mandatory_fixes.append(line_stripped)
+                    feedback.mandatory_fixes.append(line_stripped)
 
         # Score gaps
         if review.score < self.config.quality_threshold:

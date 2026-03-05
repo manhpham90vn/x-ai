@@ -13,12 +13,11 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
-
 
 # ---------------------------------------------------------------------------
 # YAML Frontmatter helpers
@@ -57,7 +56,7 @@ def new_id() -> str:
 
 def now_iso() -> str:
     """Current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # ---------------------------------------------------------------------------
