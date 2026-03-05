@@ -244,6 +244,8 @@ class XAITui(App[None]):
             work_dir=args.work_dir,
             max_rounds=args.max_rounds,
             quality_threshold=args.threshold,
+            planner_timeout_sec=args.planner_timeout,
+            executor_timeout_sec=args.executor_timeout,
             verbose=args.verbose,
         )
         self.orchestrator: Orchestrator | None = None

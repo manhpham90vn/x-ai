@@ -51,6 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quality threshold score 0-100 (default: 70.0)",
     )
     parser.add_argument(
+        "--planner-timeout",
+        type=int,
+        default=600,
+        help="Planner agent timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
+        "--executor-timeout",
+        type=int,
+        default=600,
+        help="Executor agent timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -137,6 +149,8 @@ async def async_main(args: argparse.Namespace) -> int:
         work_dir=args.work_dir,
         max_rounds=args.max_rounds,
         quality_threshold=args.threshold,
+        planner_timeout_sec=args.planner_timeout,
+        executor_timeout_sec=args.executor_timeout,
         verbose=args.verbose,
     )
 
@@ -184,6 +198,10 @@ async def async_main(args: argparse.Namespace) -> int:
     console.print(f"[dim]Max rounds:[/dim] {config.max_rounds}")
     console.print("[dim]Mode:[/dim] Planner-Executor")
     console.print(f"[dim]Threshold:[/dim] {config.quality_threshold}")
+    console.print(
+        f"[dim]Timeouts:[/dim] Planner {config.planner_timeout_sec}s, "
+        f"Executor {config.executor_timeout_sec}s"
+    )
     console.print()
 
     orchestrator = Orchestrator(config)
