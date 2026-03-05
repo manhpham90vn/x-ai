@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-ai-orchestrator"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multi-Agent AI Coding System — Planner-Executor orchestrator for Claude CLI"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,6 +30,14 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "types-PyYAML",
+    "build",
+]
+
 [project.urls]
 Homepage = "https://github.com/manhpham90vn/x-ai"
 Repository = "https://github.com/manhpham90vn/x-ai"
@@ -50,3 +58,10 @@ packages = ["x_ai_cli"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
