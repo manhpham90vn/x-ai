@@ -24,6 +24,7 @@ import shlex
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from x_ai_cli.config import Config
@@ -101,6 +102,15 @@ class TmuxSession:
         """
         _, stdout, _ = await self._shell(
             f"{self.tmux_bin} capture-pane -t {shlex.quote(session_name)} -p"
+        )
+        return stdout
+
+    async def capture_pane_color(self, session_name: str) -> str:
+        """Capture visible pane content with ANSI escape sequences intact.
+        Used for streaming rich logs to the TUI.
+        """
+        _, stdout, _ = await self._shell(
+            f"{self.tmux_bin} capture-pane -e -t {shlex.quote(session_name)} -p"
         )
         return stdout
 
@@ -392,6 +402,7 @@ class AgentRunner:
         session_name: str,
         result_file: Path,
         timeout: int,
+        stream_callback: Callable[[str], None] | None = None,
     ) -> bool:
         """Wait for Claude to write the result file on disk.
 
@@ -434,6 +445,7 @@ class AgentRunner:
 
         # Phase 2: Poll for result file + handle confirmations
         poll_interval = 2.0
+        last_yielded_lines: list[str] = []
 
         while time.monotonic() - start < timeout:
             # Check if result file exists and has content
@@ -464,7 +476,50 @@ class AgentRunner:
                 except (OSError, UnicodeDecodeError):
                     pass  # File may be partially written
 
-            # Monitor tmux for confirmations
+            # Stream colored output if a callback is provided
+            if stream_callback:
+                colored_output = await self.tmux.capture_pane_color(session_name)
+                # Split by \n to manage line diffs
+                current_lines = colored_output.rstrip("\n").split("\n")
+
+                # Simple diffing: find the first line that
+                # diverges or just append new ones.
+                # Since tmux pane buffers can scroll, finding
+                # an exact overlap can be tricky, but matching
+                # from the bottom up or finding the longest
+                # prefix overlap works best for tails.
+                # For simplicity, if screen size is fixed, we
+                # find where last_yielded matches current.
+
+                if current_lines != last_yielded_lines:
+                    # Find overlap
+                    match_idx = 0
+                    for i in range(len(current_lines)):
+                        # Look for last_yielded_lines[-1] in current_lines to resync
+                        if (
+                            last_yielded_lines
+                            and current_lines[i] == last_yielded_lines[-1]
+                        ):
+                            match_idx = i + 1
+                            break
+
+                    # If no overlap found, or first run, yield all current
+                    if match_idx == 0 and last_yielded_lines:
+                        # Maybe screen cleared or scrolled completely
+                        # Just yield the new ones that don't match index by index
+                        for i, line in enumerate(current_lines):
+                            if (
+                                i >= len(last_yielded_lines)
+                                or line != last_yielded_lines[i]
+                            ):
+                                stream_callback(line)
+                    else:
+                        for line in current_lines[match_idx:]:
+                            stream_callback(line)
+
+                    last_yielded_lines = current_lines
+
+            # Monitor tmux for confirmations (always use uncolored output)
             output = await self.tmux.capture_pane(session_name)
             if output.strip():
                 lines = output.strip().splitlines()
@@ -512,6 +567,7 @@ class AgentRunner:
         self,
         task_file: Path,
         role: str = "planner",
+        stream_callback: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Run Claude as a Planner or Executor agent in tmux session.
 
@@ -556,7 +612,9 @@ class AgentRunner:
                 return AgentResult.error("Failed to inject prompt")
 
             # 4. Wait for result file on disk
-            found = await self._wait_for_result_file(session_name, result_file, timeout)
+            found = await self._wait_for_result_file(
+                session_name, result_file, timeout, stream_callback
+            )
 
             if not found:
                 log_agent_done(f"claude:{role}", task_id, "timeout")
